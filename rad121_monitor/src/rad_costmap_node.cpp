@@ -11,6 +11,7 @@
 #include <opencv2/opencv.hpp>  // For saving as a PGM image
 #include <sys/stat.h>  // For mkdir
 #include <sys/types.h> // For mode_t
+#include <filesystem> // Needed for pwd
 
 class RadiationCostmapNode : public rclcpp::Node
 {
@@ -121,7 +122,7 @@ private:
   
   void saveMap()
     {
-    std::string save_path = std::string(getenv("HOME")) + "/rad_ws/rad_costmap_output";
+    std::string save_path = std::filesystem::current_path().string() + "/rad_costmap_output";
     std::string yaml_path = save_path + "/radiation_map.yaml";
     std::string map_pgm_path = save_path + "/map.pgm";
     std::string costmap_pgm_path = save_path + "/costmap.pgm";
@@ -196,7 +197,7 @@ private:
     // Ensure the costmap is actually applied
     cv::Mat blended_image = map_colored.clone();
 
-    // Convert blended image to grayscale for `.pgm`
+    // TODO: Convert blended image to grayscale for `.pgm`, and make it work.
     cv::Mat blended_gray;
     cv::cvtColor(blended_image, blended_gray, cv::COLOR_BGR2GRAY);
 
