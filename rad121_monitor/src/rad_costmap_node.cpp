@@ -11,7 +11,7 @@
 #include <opencv2/opencv.hpp>  // For saving as a PGM image
 #include <sys/stat.h>  // For mkdir
 #include <sys/types.h> // For mode_t
-#include <filesystem> // Needed for pwd
+#include <filesystem>  // Needed for the session folder
 
 class RadiationCostmapNode : public rclcpp::Node
 {
@@ -21,6 +21,20 @@ public:
     tf_buffer_(this->get_clock()),
     tf_listener_(tf_buffer_)
   {
+    // ------------------------- 1) Create a timestamped session folder -------------------------
+    std::time_t now = std::time(nullptr);
+    std::stringstream ss;
+    ss << "rad_" << std::put_time(std::localtime(&now), "%Y%m%d_%H%M%S");
+    session_folder_ = ss.str();
+
+    if (!std::filesystem::exists(session_folder_)) {
+      std::filesystem::create_directory(session_folder_);
+    }
+
+    // Path to the CSV file (optional, if you want to log hits).
+    csv_file_ = session_folder_ + "/rad_data.csv";
+
+    // ------------------------- Original subscriptions & publishers -------------------------
     map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
       "/map", 10,
       std::bind(&RadiationCostmapNode::mapCallback, this, std::placeholders::_1));
@@ -31,13 +45,19 @@ public:
 
     rad_costmap_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rad_costmap", 10);
 
-    RCLCPP_INFO(this->get_logger(), "Radiation Costmap Node Initialized.");
+    RCLCPP_INFO(this->get_logger(),
+                "Radiation Costmap Node Initialized. Session folder: %s",
+                session_folder_.c_str());
 
     // Register shutdown callback to save the map
     rclcpp::on_shutdown([this]() { saveMap(); });
   }
 
 private:
+  // Session folder + CSV file path
+  std::string session_folder_;
+  std::string csv_file_;
+
   void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
@@ -56,10 +76,11 @@ private:
       return;
     }
 
-    double cps = msg->data[0];
+    double cpm = msg->data[0];
+    double mrem_per_hr = msg->data[1];
 
-    if (cps < 1.0) {
-      RCLCPP_INFO(this->get_logger(), "CPS %.2f is below threshold. No mapping.", cps);
+    if (cpm < 1200.0) {
+      RCLCPP_INFO(this->get_logger(), "cpm %.2f is below threshold. No mapping.", cpm);
       return;
     }
 
@@ -102,34 +123,68 @@ private:
       return;
     }
 
-    double max_cps = 10.0;
-    double ratio = std::min(cps / max_cps, 1.0);
+    double max_cpm = 10000.0;
+    double ratio = std::min(cpm / max_cpm, 1.0);
     int scaled_value = static_cast<int>(ratio * 100.0);
 
+    // ------------------------- 2) Scatter-like expansion around the single cell -------------------------
+    int expansion_radius = 2.5; // set to 1, or larger if desired
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
-      rad_costmap_.data[map_index] = std::max(static_cast<int>(rad_costmap_.data[map_index]), scaled_value);
+      for (int dy = -expansion_radius; dy <= expansion_radius; ++dy) {
+        for (int dx = -expansion_radius; dx <= expansion_radius; ++dx) {
+          int cell_y = map_index / width;
+          int cell_x = map_index % width;
+
+          int nx = cell_x + dx;
+          int ny = cell_y + dy;
+
+          if (nx >= 0 && nx < static_cast<int>(width) &&
+              ny >= 0 && ny < static_cast<int>(height)) {
+            int neighbor_idx = ny * width + nx;
+            rad_costmap_.data[neighbor_idx] = std::max(
+                static_cast<int>(rad_costmap_.data[neighbor_idx]),
+                scaled_value
+            );
+          }
+        }
+      }
+
       rad_costmap_.header.stamp = this->now();
       rad_costmap_pub_->publish(rad_costmap_);
     }
 
+    // Optional: Log the detection to the CSV (if you want).
+    {
+      std::ofstream file(csv_file_, std::ios::app);
+      if (file.is_open()) {
+        file << cpm << "," << mrem_per_hr << "," << map_index << ","
+             << rx << "," << ry << "\n";
+        file.close();
+      } else {
+        RCLCPP_ERROR(this->get_logger(), "Failed to open %s for writing.", csv_file_.c_str());
+      }
+    }
+
     RCLCPP_INFO(
       this->get_logger(),
-      "Mapped radiation CPS=%.2f at (%.2f, %.2f) -> cell %d (scaled=%d).",
-      cps, rx, ry, map_index, scaled_value
+      "Mapped radiation cpm=%.2f at (%.2f, %.2f) -> cell %d (scaled=%d).",
+      cpm, rx, ry, map_index, scaled_value
     );
   }
   
   void saveMap()
-    {
-    std::string save_path = std::filesystem::current_path().string() + "/rad_costmap_output";
+  {
+    // ------------------------- 3) Save map images, but use the session folder -------------------------
+    std::string save_path = session_folder_; // changed from current_path + "/rad_costmap_output"
     std::string yaml_path = save_path + "/radiation_map.yaml";
     std::string map_pgm_path = save_path + "/map.pgm";
     std::string costmap_pgm_path = save_path + "/costmap.pgm";
     std::string combined_pgm_path = save_path + "/map_with_costmap.pgm";
     std::string combined_png_path = save_path + "/map_with_costmap.png";
 
-    // Ensure the directory exists
+    // Ensure the directory exists (should already exist from constructor)
+    // but we'll check again in case the user manually removed it
     struct stat info;
     if (stat(save_path.c_str(), &info) != 0) {
         if (mkdir(save_path.c_str(), 0775) != 0) {
@@ -167,73 +222,76 @@ private:
     cv::Mat costmap_image(height, width, CV_8UC1);
 
     for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int index = y * width + x;
+      for (int x = 0; x < width; x++) {
+        int index = y * width + x;
 
-            // Process `/map`
-            int map_value = base_map_.data[index];
-            if (map_value == -1) {
-                map_image.at<uchar>(height - y - 1, x) = 127;  // Unknown (gray)
-            } else if (map_value == 100) {
-                map_image.at<uchar>(height - y - 1, x) = 0;  // Occupied (black)
-            } else {
-                map_image.at<uchar>(height - y - 1, x) = 255;  // Free (white)
-            }
-
-            // Process `/rad_costmap`
-            int cost_value = rad_costmap_.data[index];
-            costmap_image.at<uchar>(height - y - 1, x) = static_cast<uchar>(cost_value * 2.55);  // Scale 0-100 → 0-255
+        // Fill map_image
+        int map_value = base_map_.data[index];
+        if (map_value == -1) {
+          map_image.at<uchar>(height - y - 1, x) = 127;  // Unknown (gray)
+        } else if (map_value == 100) {
+          map_image.at<uchar>(height - y - 1, x) = 0;  // Occupied (black)
+        } else {
+          map_image.at<uchar>(height - y - 1, x) = 255; // Free (white)
         }
+
+        // Fill costmap_image (0..100 -> 0..255)
+        int cost_value = rad_costmap_.data[index];
+        costmap_image.at<uchar>(height - y - 1, x) = static_cast<uchar>(cost_value * 2.55);
+      }
     }
 
-    // Apply heatmap coloring to the radiation costmap
+    // Heatmap coloring for the costmap
     cv::Mat costmap_colored;
-    cv::applyColorMap(costmap_image, costmap_colored, cv::COLORMAP_JET);  // Apply heatmap colors
+    cv::applyColorMap(costmap_image, costmap_colored, cv::COLORMAP_JET);
 
-    // Convert `/map` to a 3-channel grayscale image
+    // Convert map_image to a 3-channel grayscale
     cv::Mat map_colored;
     cv::cvtColor(map_image, map_colored, cv::COLOR_GRAY2BGR);
 
-    // Ensure the costmap is actually applied
+    // Blend them
     cv::Mat blended_image = map_colored.clone();
-
-    // TODO: Convert blended image to grayscale for `.pgm`, and make it work.
     cv::Mat blended_gray;
     cv::cvtColor(blended_image, blended_gray, cv::COLOR_BGR2GRAY);
 
     for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int index = y * width + x;
-
-            // If there is radiation at this cell, overlay it
-            if (rad_costmap_.data[index] > 0) {
-                double alpha = 0.5;  // 50% transparency
-                blended_image.at<cv::Vec3b>(y, x) = 
-                    (1.0 - alpha) * map_colored.at<cv::Vec3b>(y, x) + 
-                    (alpha * costmap_colored.at<cv::Vec3b>(y, x));
-            }
+      for (int x = 0; x < width; x++) {
+        int index = y * width + x;
+        if (rad_costmap_.data[index] > 0) {
+          double alpha = 0.5;
+          blended_image.at<cv::Vec3b>(y, x) =
+              (1.0 - alpha) * map_colored.at<cv::Vec3b>(y, x) +
+               alpha        * costmap_colored.at<cv::Vec3b>(y, x);
         }
+      }
     }
 
-    // Save images
-    cv::imwrite(map_pgm_path, map_image);
-    cv::imwrite(costmap_pgm_path, costmap_image);
+    // Save images into the session folder
+    cv::imwrite(map_pgm_path,      map_image);
+    cv::imwrite(costmap_pgm_path,  costmap_image);
     cv::imwrite(combined_pgm_path, blended_gray);
-    cv::imwrite(combined_png_path, blended_image);  // PNG for full-color view
+    cv::imwrite(combined_png_path, blended_image);
 
-    RCLCPP_INFO(this->get_logger(), "Maps saved: %s, %s, %s, and %s",
-                map_pgm_path.c_str(), costmap_pgm_path.c_str(), combined_pgm_path.c_str(), combined_png_path.c_str());
-    }
+    RCLCPP_INFO(this->get_logger(),
+                "Maps saved in session folder: %s\n - %s\n - %s\n - %s\n - %s",
+                save_path.c_str(),
+                map_pgm_path.c_str(),
+                costmap_pgm_path.c_str(),
+                combined_pgm_path.c_str(),
+                combined_png_path.c_str());
+  }
 
-
+  // Original subscriber/publisher members
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr rad_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr rad_costmap_pub_;
 
+  // Original stored maps
   nav_msgs::msg::OccupancyGrid base_map_;
   nav_msgs::msg::OccupancyGrid rad_costmap_;
   std::mutex map_mutex_;
 
+  // TF buffer & listener
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 };
