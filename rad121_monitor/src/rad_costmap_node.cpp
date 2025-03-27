@@ -160,7 +160,7 @@ private:
     }
 
     if (cpm < 1200.0) {
-      RCLCPP_INFO(this->get_logger(), "cpm %.2f is below threshold. No mapping. (But CSV was logged)", cpm);
+      RCLCPP_INFO(this->get_logger(), "cpm %.2f is below threshold. No mapping.", cpm);
       return;
     }
 
