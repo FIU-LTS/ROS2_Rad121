@@ -26,15 +26,21 @@ add_executable(rad121_monitor_node src/rad121_monitor_node.cpp src/CUSB_RAD121.c
 target_link_libraries(rad121_monitor_node ${LIBFTDI_LIBRARIES})
 ament_target_dependencies(rad121_monitor_node rclcpp std_msgs)
 
-# Radiation costmap node (NEW)
+# Radiation costmap node
 add_executable(rad_costmap_node src/rad_costmap_node.cpp)
-target_link_libraries(rad_costmap_node ${OpenCV_LIBS})
+target_link_libraries(rad_costmap_node ${OpenCV_LIBRARIES})
 ament_target_dependencies(rad_costmap_node rclcpp std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
+
+# Radiation Heatmap Node
+add_executable(rad_heatmap_node src/rad_heatmap_node.cpp)
+target_link_libraries(rad_heatmap_node ${OpenCV_LIBRARIES})
+ament_target_dependencies(rad_heatmap_node rclcpp std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
 
 # Install targets
 install(TARGETS
   rad121_monitor_node
   rad_costmap_node
+  rad_heatmap_node
   DESTINATION lib/${PROJECT_NAME})
 
 # Install headers and launch files
