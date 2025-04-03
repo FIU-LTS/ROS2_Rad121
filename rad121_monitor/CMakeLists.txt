@@ -10,6 +10,9 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(image_transport REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -34,7 +37,7 @@ ament_target_dependencies(rad_costmap_node rclcpp std_msgs nav_msgs tf2 tf2_ros 
 # Radiation Heatmap Node
 add_executable(rad_heatmap_node src/rad_heatmap_node.cpp)
 target_link_libraries(rad_heatmap_node ${OpenCV_LIBRARIES})
-ament_target_dependencies(rad_heatmap_node rclcpp std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
+ament_target_dependencies(rad_heatmap_node rclcpp cv_bridge sensor_msgs image_transport std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
 
 # Install targets
 install(TARGETS

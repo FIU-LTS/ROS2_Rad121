@@ -1,5 +1,8 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "cv_bridge/cv_bridge.h"
+#include "image_transport/image_transport.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "tf2_ros/transform_listener.h"
@@ -9,8 +12,6 @@
 #include <mutex>
 #include <fstream>
 #include <opencv2/opencv.hpp>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <filesystem>
 #include <ctime>
 #include <iomanip>
@@ -21,265 +22,336 @@
 class RadiationHeatmapNode : public rclcpp::Node
 {
 public:
-  RadiationHeatmapNode()
-  : Node("radiation_heatmap_node"),
-    tf_buffer_(this->get_clock()),
-    tf_listener_(tf_buffer_)
-  {
-    std::time_t now = std::time(nullptr);
-    std::stringstream ss;
-    ss << "rad_" << std::put_time(std::localtime(&now), "%Y%m%d_%H%M%S");
-    session_folder_ = ss.str();
+    RadiationHeatmapNode()
+        : Node("radiation_heatmap_node"),
+          tf_buffer_(this->get_clock()),
+          tf_listener_(tf_buffer_)
+    {
+        std::stringstream ss;
+        std::time_t now = std::time(nullptr);
+        ss << "rad_" << std::put_time(std::localtime(&now), "%Y%m%d_%H%M%S");
+        session_folder_ = ss.str();
+        std::filesystem::create_directory(session_folder_);
 
-    if (!std::filesystem::exists(session_folder_)) {
-      std::filesystem::create_directory(session_folder_);
+        map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+            "/map", 10, std::bind(&RadiationHeatmapNode::mapCallback, this, std::placeholders::_1));
+        rad_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+            "/rad", 10, std::bind(&RadiationHeatmapNode::radCallback, this, std::placeholders::_1));
+        rad_costmap_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rad_heatmap", 10);
+
+        RCLCPP_INFO(this->get_logger(), "Radiation Heatmap Node Initialized. Session folder: %s", session_folder_.c_str());
+        rclcpp::on_shutdown([this]()
+                            { saveMap(); });
     }
 
-    map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-      "/map", 10,
-      std::bind(&RadiationHeatmapNode::mapCallback, this, std::placeholders::_1));
-
-    rad_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
-      "/rad", 10,
-      std::bind(&RadiationHeatmapNode::radCallback, this, std::placeholders::_1));
-
-    rad_costmap_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rad_heatmap", 10);
-
-    RCLCPP_INFO(this->get_logger(), "Radiation Heatmap Node Initialized. Session folder: %s", session_folder_.c_str());
-
-    rclcpp::on_shutdown([this]() { saveMap(); });
-  }
+    void init_image_transport()
+    {
+        image_transport::ImageTransport it(shared_from_this());
+        rad_image_pub_ = it.advertise("/rad_heatmap_image", 1);
+    }
 
 private:
-    struct RadiationSample {
-        double x, y;
-        double cpm;
-        double yaw;
+    struct RadiationSample
+    {
+        double x, y, cpm;
     };
 
     bool isVisible(int x0, int y0, int x1, int y1)
     {
-        int dx = std::abs(x1 - x0);
-        int dy = -std::abs(y1 - y0);
-        int sx = x0 < x1 ? 1 : -1;
-        int sy = y0 < y1 ? 1 : -1;
-        int err = dx + dy;
+        int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+        int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
         int width = base_map_.info.width;
 
-        int max_range_cells = static_cast<int>(3.0 / base_map_.info.resolution);  // 2 meters max range
-        int step_count = 0;
-
-        while (true) {
-        if (++step_count > max_range_cells) return false;
-        int idx = y0 * width + x0;
-        if (base_map_.data[idx] >= 50) return false;
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+        while (true)
+        {
+            int idx = y0 * width + x0;
+            if (base_map_.data[idx] >= 50)
+                return false;
+            if (x0 == x1 && y0 == y1)
+                break;
+            int e2 = 2 * err;
+            if (e2 >= dy)
+            {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx)
+            {
+                err += dx;
+                y0 += sy;
+            }
         }
         return true;
     }
 
-  void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
-  {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-
-    bool map_changed = false;
-    if (base_map_.info.width != msg->info.width ||
-        base_map_.info.height != msg->info.height ||
-        base_map_.info.resolution != msg->info.resolution ||
-        base_map_.info.origin.position.x != msg->info.origin.position.x ||
-        base_map_.info.origin.position.y != msg->info.origin.position.y) {
-      map_changed = true;
-    }
-
-    base_map_ = *msg;
-
-    if (rad_costmap_.data.empty() || map_changed) {
-      nav_msgs::msg::OccupancyGrid new_costmap = *msg;
-      new_costmap.data.assign(new_costmap.info.width * new_costmap.info.height, 0);
-
-      rad_costmap_ = new_costmap;
-      rad_field_ = cv::Mat::zeros(new_costmap.info.height, new_costmap.info.width, CV_32FC1);
-
-      RCLCPP_INFO(this->get_logger(), "Rad costmap and field initialized/resized to %ux%u",
-                  new_costmap.info.width, new_costmap.info.height);
-    }
-  }
-
-  void radCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
-  {
-    double cpm = msg->data[0];
-    if (cpm < 400.0) {  // Lower threshold for visibility
-      return;
-    }
-
-    geometry_msgs::msg::PoseStamped pose_in, pose_out;
-    pose_in.header.frame_id = "base_link";
-    pose_in.header.stamp = this->now();
-
-    try {
-      auto transform = tf_buffer_.lookupTransform("map", "base_link", tf2::TimePointZero);
-      tf2::doTransform(pose_in, pose_out, transform);
-    } catch (tf2::TransformException &ex) {
-      return;
-    }
-
-    double rx = pose_out.pose.position.x;
-    double ry = pose_out.pose.position.y;
-
-    tf2::Quaternion q;
-    tf2::fromMsg(pose_out.pose.orientation, q);
-    double roll, pitch, yaw;
-    tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
-
+    void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    samples_.push_back({rx, ry, cpm});
-    updateRadiationField();
-    RCLCPP_INFO(this->get_logger(),
-        "Mapped radiation reading: cpm=%.2f at (%.2f, %.2f).",
-        cpm, rx, ry);
-    }
-  }
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        bool map_changed = base_map_.info.width != msg->info.width ||
+                           base_map_.info.height != msg->info.height ||
+                           base_map_.info.resolution != msg->info.resolution ||
+                           base_map_.info.origin.position.x != msg->info.origin.position.x ||
+                           base_map_.info.origin.position.y != msg->info.origin.position.y;
 
-  void updateRadiationField()
-  {
-    rad_field_ = cv::Mat::zeros(base_map_.info.height, base_map_.info.width, CV_32FC1);
-  
-    double sigma_x = 2.0;  // Short axis (perpendicular to robot heading)
-    double sigma_y = 2.0;  // Long axis (aligned with robot heading)
-    double inv_2sigma2_x = 1.0 / (2.0 * sigma_x * sigma_x);
-    double inv_2sigma2_y = 1.0 / (2.0 * sigma_y * sigma_y);
-    double res = base_map_.info.resolution;
-    double origin_x = base_map_.info.origin.position.x;
-    double origin_y = base_map_.info.origin.position.y;
-  
-    for (int y = 0; y < rad_field_.rows; ++y) {
-      for (int x = 0; x < rad_field_.cols; ++x) {
-        double wx = origin_x + x * res + res / 2.0;
-        double wy = origin_y + y * res + res / 2.0;
-  
-        double numerator = 0.0;
-        double denominator = 0.0;
-  
-        for (const auto& sample : samples_) {
-          if (sample.cpm < 100.0) continue;  // Suppress background
-  
-          int sx = static_cast<int>((sample.x - origin_x) / res);
-          int sy = static_cast<int>((sample.y - origin_y) / res);
-  
-          if (sx < 0 || sx >= rad_field_.cols || sy < 0 || sy >= rad_field_.rows)
-            continue;
-          if (!isVisible(sx, sy, x, y))
-            continue;
-  
-          double dx = wx - sample.x;
-          double dy = wy - sample.y;
-  
-          // Rotate the difference vector into sample's robot frame
-          double cos_yaw = std::cos(sample.yaw);
-          double sin_yaw = std::sin(sample.yaw);
-          double rx =  cos_yaw * dx + sin_yaw * dy;
-          double ry = -sin_yaw * dx + cos_yaw * dy;
-  
-          // Elliptical Gaussian weight
-          double weight = std::exp(-(rx * rx * inv_2sigma2_y + ry * ry * inv_2sigma2_x));
-          numerator += weight * sample.cpm;
-          denominator += weight;
+        base_map_ = *msg;
+
+        if (rad_costmap_.data.empty() || map_changed)
+        {
+            rad_costmap_ = *msg;
+            rad_costmap_.data.assign(msg->info.width * msg->info.height, 0);
+            rad_field_ = cv::Mat::zeros(msg->info.height, msg->info.width, CV_32FC1);
+            RCLCPP_INFO(this->get_logger(), "Rad costmap and field initialized/resized to %ux%u", msg->info.width, msg->info.height);
         }
-  
-        float estimated = (denominator > 0.0) ? static_cast<float>(numerator / denominator) : 0.0f;
-        rad_field_.at<float>(y, x) = estimated;
-      }
-    }
-  
-    // Optional: apply smoothing filter
-    cv::GaussianBlur(rad_field_, rad_field_, cv::Size(5, 5), 1.5);
-  
-    // Autoscale for visualization
-    float max_cpm = 0.0f;
-    for (int y = 0; y < rad_field_.rows; ++y)
-      for (int x = 0; x < rad_field_.cols; ++x)
-        max_cpm = std::max(max_cpm, rad_field_.at<float>(y, x));
-  
-    float scale = (max_cpm > 0.0f) ? 100.0f / max_cpm : 0.0f;
-  
-    for (int y = 0; y < rad_field_.rows; ++y) {
-      for (int x = 0; x < rad_field_.cols; ++x) {
-        float value = rad_field_.at<float>(y, x) * scale;
-        rad_costmap_.data[y * rad_field_.cols + x] =
-          static_cast<int8_t>(std::clamp(value, 0.0f, 100.0f));
-      }
-    }
-  
-    rad_costmap_.header.stamp = this->now();
-    rad_costmap_pub_->publish(rad_costmap_);
-  }
-  
-  void saveMap()
-  {
-    std::string output_path = session_folder_ + "/heatmap.png";
-
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    if (rad_field_.empty() || base_map_.data.empty()) {
-      return;
     }
 
-    int width = base_map_.info.width;
-    int height = base_map_.info.height;
+    void radCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+    {
+        if (msg->data[0] < 400.0)
+            return;
 
-    cv::Mat map_img(height, width, CV_8UC1);
-    for (int y = 0; y < height; ++y) {
-      for (int x = 0; x < width; ++x) {
-        int idx = y * width + x;
-        int val = base_map_.data[idx];
-        if (val == -1) map_img.at<uchar>(y, x) = 127;
-        else if (val == 100) map_img.at<uchar>(y, x) = 0;
-        else map_img.at<uchar>(y, x) = 255;
-      }
+        geometry_msgs::msg::PoseStamped pose_in, pose_out;
+        pose_in.header.frame_id = "base_link";
+        pose_in.header.stamp = this->now();
+
+        try
+        {
+            tf2::doTransform(pose_in, pose_out, tf_buffer_.lookupTransform("map", "base_link", tf2::TimePointZero));
+        }
+        catch (tf2::TransformException &)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        samples_.push_back({pose_out.pose.position.x, pose_out.pose.position.y, msg->data[0]});
+        updateRadiationField();
     }
 
-    cv::Mat map_bgr;
-    cv::cvtColor(map_img, map_bgr, cv::COLOR_GRAY2BGR);
+    void updateRadiationField()
+    {
+        rad_field_ = cv::Mat::zeros(base_map_.info.height, base_map_.info.width, CV_32FC1);
+        double res = base_map_.info.resolution, sigma = 5.0, inv_2sigma2 = 1.0 / (2.0 * sigma * sigma);
+        double origin_x = base_map_.info.origin.position.x, origin_y = base_map_.info.origin.position.y;
 
-    cv::Mat field_mask;
-    rad_field_.convertTo(field_mask, CV_8UC1, 255.0 / 10000.0);
-    cv::medianBlur(field_mask, field_mask, 3);  // remove salt-and-pepper noise
-    cv::threshold(field_mask, field_mask, 10, 255, cv::THRESH_TOZERO);  // suppress near-zero noise
-    cv::Mat field_color;
-    cv::applyColorMap(field_mask, field_color, cv::COLORMAP_JET);
+        for (int y = 0; y < rad_field_.rows; ++y)
+        {
+            for (int x = 0; x < rad_field_.cols; ++x)
+            {
+                double wx = origin_x + x * res + res / 2.0, wy = origin_y + y * res + res / 2.0;
+                double numerator = 0.0, denominator = 0.0;
 
-    cv::Mat blend;
-    double alpha = 0.5;
-    cv::addWeighted(map_bgr, 1.0 - alpha, field_color, alpha, 0.0, blend);
+                for (const auto &sample : samples_)
+                {
+                    if (sample.cpm < 100.0)
+                        continue;
 
-    cv::flip(blend, blend, 0);
-    cv::imwrite(output_path, blend);
-  }
+                    int sx = (sample.x - origin_x) / res, sy = (sample.y - origin_y) / res;
+                    if (sx < 0 || sx >= rad_field_.cols || sy < 0 || sy >= rad_field_.rows)
+                        continue;
+                    if (!isVisible(sx, sy, x, y))
+                        continue;
 
-  std::string session_folder_;
+                    double dx = wx - sample.x, dy = wy - sample.y, dist2 = dx * dx + dy * dy;
+                    if (dist2 > 4.0)
+                        continue;
 
-  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr rad_sub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr rad_costmap_pub_;
+                    double weight = std::exp(-dist2 * inv_2sigma2);
+                    numerator += weight * sample.cpm;
+                    denominator += weight;
+                }
 
-  nav_msgs::msg::OccupancyGrid base_map_;
-  nav_msgs::msg::OccupancyGrid rad_costmap_;
-  cv::Mat rad_field_;
-  std::vector<RadiationSample> samples_;
-  std::mutex map_mutex_;
+                rad_field_.at<float>(y, x) = (denominator > 0.0) ? static_cast<float>(numerator / denominator) : 0.0f;
+            }
+        }
 
-  tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
+        cv::GaussianBlur(rad_field_, rad_field_, cv::Size(15, 15), 5.0);
+
+        const float background_threshold = 50.0f;
+        std::vector<float> values;
+        for (int y = 0; y < rad_field_.rows; ++y)
+        {
+            for (int x = 0; x < rad_field_.cols; ++x)
+            {
+                float &val = rad_field_.at<float>(y, x);
+                if (val < background_threshold)
+                    val = 0.0f;
+                else
+                    values.push_back(val);
+            }
+        }
+
+        min_cpm_ = 400.0f, max_cpm_ = 10000.0f;
+        if (values.size() >= 50)
+        {
+            std::sort(values.begin(), values.end());
+            min_cpm_ = std::max(400.0f, values[values.size() * 0.05]);
+            max_cpm_ = values[values.size() * 0.95];
+            if (max_cpm_ - min_cpm_ < 1.0f)
+                max_cpm_ = min_cpm_ + 1.0f;
+        }
+
+        float log_min = std::log(min_cpm_), log_max = std::log(max_cpm_);
+
+        for (int y = 0; y < rad_field_.rows; ++y)
+        {
+            for (int x = 0; x < rad_field_.cols; ++x)
+            {
+                float val = rad_field_.at<float>(y, x);
+                if (val < background_threshold)
+                {
+                    rad_costmap_.data[y * rad_field_.cols + x] = -1;
+                }
+                else
+                {
+                    float log_val = std::log(std::max(val, min_cpm_));
+                    float scaled = 100.0f * (log_val - log_min) / (log_max - log_min);
+                    int8_t bucketed = static_cast<int8_t>(std::round(scaled / 5.0f) * 5.0f);
+                    rad_costmap_.data[y * rad_field_.cols + x] = bucketed;
+                }
+            }
+        }
+
+        cv::Mat norm_field, color_field;
+        cv::Mat scaled_field = cv::Mat::zeros(rad_field_.size(), CV_8UC1);
+        for (int y = 0; y < rad_field_.rows; ++y)
+        {
+            for (int x = 0; x < rad_field_.cols; ++x)
+            {
+                float val = rad_field_.at<float>(y, x);
+                if (val < background_threshold)
+                {
+                    scaled_field.at<uchar>(y, x) = 0;
+                }
+                else
+                {
+                    float log_val = std::log(std::max(val, min_cpm_));
+                    float scaled = 255.0f * (log_val - log_min) / (log_max - log_min);
+                    scaled_field.at<uchar>(y, x) = static_cast<uchar>(std::clamp(scaled, 0.0f, 255.0f));
+                }
+            }
+        }
+        cv::applyColorMap(scaled_field, color_field, cv::COLORMAP_JET);
+        // Create the grayscale base map image
+        cv::Mat base_gray(rad_field_.rows, rad_field_.cols, CV_8UC1);
+        for (int y = 0; y < rad_field_.rows; ++y)
+        {
+            for (int x = 0; x < rad_field_.cols; ++x)
+            {
+                int idx = y * rad_field_.cols + x;
+                int8_t occ = base_map_.data[idx];
+                base_gray.at<uchar>(y, x) = (occ == -1) ? 127 : (occ == 100 ? 0 : 255);
+            }
+        }
+
+        // Convert grayscale to BGR
+        cv::Mat base_bgr;
+        cv::cvtColor(base_gray, base_bgr, cv::COLOR_GRAY2BGR);
+
+        // Blend with the heatmap
+        cv::Mat blended;
+        cv::addWeighted(base_bgr, 0.5, color_field, 0.5, 0.0, blended);
+        int legend_bar_height = 40;
+        int legend_padding = 10;
+        int tick_font = cv::FONT_HERSHEY_SIMPLEX;
+        float tick_font_scale = 0.4;
+        int tick_thickness = 1;
+        
+        int bar_width = blended.cols - 2 * legend_padding;
+        cv::Mat legend_bar(legend_bar_height + 30, blended.cols, CV_8UC3, cv::Scalar(255, 255, 255));
+        
+        // Build horizontal color gradient
+        for (int x = 0; x < bar_width; ++x)
+        {
+            uchar value = static_cast<uchar>((float)x / bar_width * 255);
+            cv::Mat input_pixel(1, 1, CV_8UC1, cv::Scalar(value));
+            cv::Mat color_pixel;
+            cv::applyColorMap(input_pixel, color_pixel, cv::COLORMAP_JET);
+            cv::Vec3b color = color_pixel.at<cv::Vec3b>(0, 0);
+                        for (int y = legend_padding; y < legend_bar_height; ++y)
+            {
+                legend_bar.at<cv::Vec3b>(y, x + legend_padding) = color;
+            }
+        }
+        
+        // Draw min and max text
+        char min_buf[16], max_buf[16];
+        snprintf(min_buf, sizeof(min_buf), "%.0f", min_cpm_);
+        snprintf(max_buf, sizeof(max_buf), "%.0f", max_cpm_);
+        cv::putText(legend_bar, min_buf, cv::Point(legend_padding, legend_bar_height + 25), tick_font, tick_font_scale, cv::Scalar(0, 0, 0), tick_thickness);
+        cv::putText(legend_bar, max_buf, cv::Point(legend_padding + bar_width - 40, legend_bar_height + 25), tick_font, tick_font_scale, cv::Scalar(0, 0, 0), tick_thickness);
+        
+        // Label
+        std::string label = "Radiation Level (CPM)";
+        int base_line = 0;
+        cv::Size text_size = cv::getTextSize(label, tick_font, 0.5, 1, &base_line);
+        cv::putText(legend_bar, label,
+                    cv::Point((legend_bar.cols - text_size.width) / 2, legend_padding - 2 + text_size.height),
+                    tick_font, 0.5, cv::Scalar(0, 0, 0), 1);
+        
+        // ---- Combine with heatmap ----
+        cv::Mat full_img(blended.rows + legend_bar.rows, blended.cols, CV_8UC3);
+        blended.copyTo(full_img(cv::Rect(0, 0, blended.cols, blended.rows)));
+        legend_bar.copyTo(full_img(cv::Rect(0, blended.rows, legend_bar.cols, legend_bar.rows)));
+        
+        latest_blended_image_ = full_img.clone(); // Save for export
+        // Flip if needed (to match map orientation)
+        cv::flip(blended, blended, 0);
+
+        std_msgs::msg::Header header;
+        header.frame_id = "map";
+
+        sensor_msgs::msg::Image::SharedPtr msg =
+            cv_bridge::CvImage(header, "bgr8", blended).toImageMsg();
+
+        if (rad_image_pub_.getNumSubscribers() > 0)
+        {
+            rad_image_pub_.publish(msg);
+        }
+
+        rad_costmap_.header.stamp = this->now();
+        rad_costmap_pub_->publish(rad_costmap_);
+    }
+
+    void saveMap()
+    {
+        std::string output_path = session_folder_ + "/map_with_costmap.png";
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        
+        if (latest_blended_image_.empty())
+        {
+            RCLCPP_WARN(this->get_logger(), "No blended image available to save.");
+            return;
+        }
+    
+        cv::imwrite(output_path, latest_blended_image_);
+        cv::imwrite(session_folder_ + "/raw_field.png", rad_field_);
+        RCLCPP_INFO(this->get_logger(), "Saved blended heatmap to: %s", output_path.c_str());
+    }
+
+    std::string session_folder_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr rad_sub_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr rad_costmap_pub_;
+    image_transport::Publisher rad_image_pub_;
+    cv::Mat latest_blended_image_;
+
+
+    nav_msgs::msg::OccupancyGrid base_map_, rad_costmap_;
+    cv::Mat rad_field_;
+    std::vector<RadiationSample> samples_;
+    std::mutex map_mutex_;
+    float min_cpm_ = 400.0f;
+    float max_cpm_ = 10000.0f;
+    tf2_ros::Buffer tf_buffer_;
+    tf2_ros::TransformListener tf_listener_;
 };
 
 int main(int argc, char **argv)
 {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<RadiationHeatmapNode>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<RadiationHeatmapNode>();
+    node->init_image_transport();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
 }
