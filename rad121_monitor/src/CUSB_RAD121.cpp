@@ -1,10 +1,7 @@
 #include "CUSB_RAD121.h"
 #include <iostream>
 #include <cmath>
-#include <ctime>
-
-#define USB_RAD121_SENSITIVITY 450
-#define USB_RAD121_DEAD_TIME 0.00015
+#include <libftdi1/ftdi.h>
 
 CUSB_RAD121::CUSB_RAD121()
 {
@@ -28,7 +25,6 @@ bool CUSB_RAD121::Open()
     ftdi_set_baudrate(ftHandle, 921600);
     ftdi_set_line_property(ftHandle, BITS_8, STOP_BIT_1, NONE);
     ftdi_usb_purge_buffers(ftHandle);
-    LastCountsTime = std::chrono::steady_clock::now();
     std::cerr << "FTDI device opened successfully" << std::endl;
 
     return true;
@@ -36,12 +32,7 @@ bool CUSB_RAD121::Open()
 
 bool CUSB_RAD121::Close()
 {
-    if (ftdi_usb_close(ftHandle) < 0)
-    {
-        std::cerr << "Failed to close FTDI device" << std::endl;
-        return false;
-    }
-    return true;
+    return ftdi_usb_close(ftHandle) == 0;
 }
 
 int CUSB_RAD121::ReadData(unsigned char* buffer, int size)
@@ -49,13 +40,20 @@ int CUSB_RAD121::ReadData(unsigned char* buffer, int size)
     return ftdi_read_data(ftHandle, buffer, size);
 }
 
-double CUSB_RAD121::Calculate_CompensatedCPM(double CountsPerMinute)
+void CUSB_RAD121::ConfigureFromNode(std::shared_ptr<rclcpp::Node> node)
 {
-    return CountsPerMinute / (1.0 - (CountsPerMinute / 60.0) * USB_RAD121_DEAD_TIME);
+    dead_time_ = node->declare_parameter("usb_rad121.dead_time", 0.00015);
+    sensitivity_ = node->declare_parameter("usb_rad121.sensitivity", 450.0);
 }
 
-double CUSB_RAD121::Calculate_mRhr(double CountsPerMinute)
+double CUSB_RAD121::Calculate_CompensatedCPM(double cpm)
 {
-    return CountsPerMinute / USB_RAD121_SENSITIVITY;
+    double cps = cpm / 60.0;
+    double correction = 1.0 - cps * dead_time_;
+    return (correction > 0.0) ? cpm / correction : 0.0;
 }
 
+double CUSB_RAD121::Calculate_mRhr(double cpm)
+{
+    return cpm / sensitivity_;
+}

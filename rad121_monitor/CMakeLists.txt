@@ -19,6 +19,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(message_filters REQUIRED)
 pkg_check_modules(LIBFTDI REQUIRED libftdi1)
 
 # Include directories
@@ -39,18 +40,27 @@ add_executable(rad_heatmap_node src/rad_heatmap_node.cpp)
 target_link_libraries(rad_heatmap_node ${OpenCV_LIBRARIES})
 ament_target_dependencies(rad_heatmap_node rclcpp cv_bridge sensor_msgs image_transport std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
 
+# Radiation Pointcloud Node
+add_executable(rad_pointcloud_node src/rad_pointcloud_node.cpp)
+target_link_libraries(rad_pointcloud_node ${OpenCV_LIBRARIES})
+ament_target_dependencies(rad_pointcloud_node rclcpp cv_bridge sensor_msgs image_transport std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV message_filters)
+
 # Install targets
 install(TARGETS
   rad121_monitor_node
   rad_costmap_node
   rad_heatmap_node
+  rad_pointcloud_node
   DESTINATION lib/${PROJECT_NAME})
 
-# Install headers and launch files
+# Install headers, launch files, and params.
 install(DIRECTORY include/
   DESTINATION include/)
 
 install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME})
+
+install(DIRECTORY params
   DESTINATION share/${PROJECT_NAME})
 
 ament_package()

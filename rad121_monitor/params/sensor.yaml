@@ -1,0 +1,4 @@
+rad121_monitor_node:
+  ros__parameters:
+    dead_time: 0.00015        # Seconds
+    sensitivity: 450.0        # CPM per mR/hr

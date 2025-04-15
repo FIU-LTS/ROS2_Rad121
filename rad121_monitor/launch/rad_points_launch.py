@@ -7,15 +7,15 @@ def generate_launch_description():
     param_file = os.path.join(
         get_package_share_directory('rad121_monitor'),
         'params',
-        'sensor.yaml'
+        'pointcloud.yaml'
     )
 
     return LaunchDescription([
         Node(
             package='rad121_monitor',
-            executable='rad121_monitor_node',
-            name='rad121_monitor_node',
-            parameters=[param_file],
+            executable='rad_pointcloud_node',
+            name='rad_pointcloud_node',
+            parameters=[{'use_sim_time': True},param_file],
             output='screen'
         )
     ])
