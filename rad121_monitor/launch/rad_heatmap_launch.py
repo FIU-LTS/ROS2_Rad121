@@ -15,7 +15,7 @@ def generate_launch_description():
             package='rad121_monitor',
             executable='rad_heatmap_node',
             name='rad_heatmap_node',
-            parameters=[{'use_sim_time': True},param_file],
+            parameters=[param_file],
             output='screen'
         )
     ])

@@ -1,15 +1,18 @@
 rad_pointcloud_node:
   ros__parameters:
-    sensor_frame: "base_link" # Or your actual sensor frame like "geiger_link"
-    map_frame: "map"
-    rad_topic: "/rad"
-    lidar_topic: "/velodyne_points"
-    output_topic: "/rad_points"
-    sensor_offset_z: 0.5      # Only used if sensor_frame is base_link or similar
-    cpm_to_mr_per_hr: 0.00222
-    attenuation_coefficient_cm: 0.00012 # Keep original unit here (cm^-1)
-    min_cpm_threshold: 10.0
-    ray_step_meters: 0.05
-    ray_max_distance: 3.0
-    rays_per_reading: 100      # NEW: Number of rays
-    min_intensity_publish: 1.0 # NEW: Minimum intensity to include in cloud
+    use_sim_time: True 
+    radiation_topic: "/rad"
+    lidar_topic: "/velodyne_points"             
+    output_topic: "/rad_pointcloud_accumulated" 
+    source_estimate_topic: "/rad_source_estimate"
+    sensor_frame: "base_link"             
+    map_frame: "map"                      
+    save_ply_directory: "/home/brendoncintas/radmon_ws/"
+    save_ply_base_name: "rad_cloud"
+    attenuation_coefficient_cm: 0.00012   
+    min_cpm_threshold: 300.0             
+    ray_max_distance: 4.0                
+    min_intensity_publish: 1.0            
+    voxel_resolution: 0.1                 
+    publish_rate: 1.0                     
+    tf_lookup_timeout: 0.15               

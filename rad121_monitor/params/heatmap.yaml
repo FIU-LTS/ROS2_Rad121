@@ -1,6 +1,8 @@
 rad_heatmap_node:
   ros__parameters:
+    use_sim_time: True
     sensor_frame: "base_link"
+    output_directory: "/home/brendoncintas/radmon_ws/data/"
     map_frame: "map"
     min_valid_cpm: 400.0
     min_sample_cpm: 100.0

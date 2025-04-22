@@ -1,16 +1,16 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.8)
 project(rad121_monitor)
 
-# Default to C++17 (ROS 2 recommends this)
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
 endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -20,32 +20,62 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(message_filters REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(PCL REQUIRED COMPONENTS Common IO)
+find_package(octomap REQUIRED)
+find_package(octomap_msgs REQUIRED)
 pkg_check_modules(LIBFTDI REQUIRED libftdi1)
 
-# Include directories
 include_directories(include ${LIBFTDI_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 
-# Radiation sensor node
 add_executable(rad121_monitor_node src/rad121_monitor_node.cpp src/CUSB_RAD121.cpp)
-target_link_libraries(rad121_monitor_node ${LIBFTDI_LIBRARIES})
 ament_target_dependencies(rad121_monitor_node rclcpp std_msgs)
+target_link_libraries(rad121_monitor_node ${LIBFTDI_LIBRARIES})
 
-# Radiation costmap node
 add_executable(rad_costmap_node src/rad_costmap_node.cpp)
+ament_target_dependencies(rad_costmap_node
+  rclcpp
+  std_msgs
+  nav_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+)
 target_link_libraries(rad_costmap_node ${OpenCV_LIBRARIES})
-ament_target_dependencies(rad_costmap_node rclcpp std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
 
-# Radiation Heatmap Node
 add_executable(rad_heatmap_node src/rad_heatmap_node.cpp)
+ament_target_dependencies(rad_heatmap_node
+  rclcpp
+  cv_bridge
+  sensor_msgs
+  image_transport
+  std_msgs
+  nav_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+)
 target_link_libraries(rad_heatmap_node ${OpenCV_LIBRARIES})
-ament_target_dependencies(rad_heatmap_node rclcpp cv_bridge sensor_msgs image_transport std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV)
 
-# Radiation Pointcloud Node
 add_executable(rad_pointcloud_node src/rad_pointcloud_node.cpp)
-target_link_libraries(rad_pointcloud_node ${OpenCV_LIBRARIES})
-ament_target_dependencies(rad_pointcloud_node rclcpp cv_bridge sensor_msgs image_transport std_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs OpenCV message_filters)
+ament_target_dependencies(rad_pointcloud_node
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  std_srvs
+  pcl_conversions
+  octomap_msgs
+)
+target_link_libraries(rad_pointcloud_node
+  ${PCL_LIBRARIES}
+  ${OCTOMAP_LIBRARIES}
+)
 
-# Install targets
 install(TARGETS
   rad121_monitor_node
   rad_costmap_node
@@ -53,7 +83,6 @@ install(TARGETS
   rad_pointcloud_node
   DESTINATION lib/${PROJECT_NAME})
 
-# Install headers, launch files, and params.
 install(DIRECTORY include/
   DESTINATION include/)
 
