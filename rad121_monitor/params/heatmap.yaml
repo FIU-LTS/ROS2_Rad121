@@ -4,9 +4,11 @@ rad_heatmap_node:
     sensor_frame: "base_link"
     output_directory: "/home/brendoncintas/radmon_ws/data/"
     map_frame: "map"
-    min_valid_cpm: 400.0
-    min_sample_cpm: 100.0
+    min_valid_cpm: 200.0
+    min_sample_cpm: 0.0
     gaussian_sigma: 5.0
     gaussian_blur_size: 15  # must be odd
     distance_cutoff: 4.0
-    background_threshold: 50.0
+    background_threshold: 0.0
+    predefined_zones_file: "/home/brendoncintas/radmon_ws/src/ROS2_rad121/rad121_monitor/params/predefined_zones.yaml"
+

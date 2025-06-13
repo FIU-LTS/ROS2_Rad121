@@ -25,6 +25,9 @@ find_package(std_srvs REQUIRED)
 find_package(PCL REQUIRED COMPONENTS Common IO)
 find_package(octomap REQUIRED)
 find_package(octomap_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)
+
 pkg_check_modules(LIBFTDI REQUIRED libftdi1)
 
 include_directories(include ${LIBFTDI_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
@@ -55,8 +58,12 @@ ament_target_dependencies(rad_heatmap_node
   tf2
   tf2_ros
   tf2_geometry_msgs
+  visualization_msgs
 )
-target_link_libraries(rad_heatmap_node ${OpenCV_LIBRARIES})
+target_link_libraries(rad_heatmap_node
+  ${OpenCV_LIBRARIES}
+  yaml-cpp
+)
 
 add_executable(rad_pointcloud_node src/rad_pointcloud_node.cpp)
 ament_target_dependencies(rad_pointcloud_node
@@ -76,11 +83,24 @@ target_link_libraries(rad_pointcloud_node
   ${OCTOMAP_LIBRARIES}
 )
 
+add_executable(zone_selector_node src/zone_selector.cpp)
+ament_target_dependencies(zone_selector_node
+  rclcpp
+  geometry_msgs
+  tf2_ros
+  tf2_geometry_msgs
+  std_srvs
+)
+target_link_libraries(zone_selector_node
+  yaml-cpp
+)
+
 install(TARGETS
   rad121_monitor_node
   rad_costmap_node
   rad_heatmap_node
   rad_pointcloud_node
+  zone_selector_node
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/

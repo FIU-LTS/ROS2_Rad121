@@ -1,0 +1,7 @@
+zone_selector_node: # This should match the name you give your node when launching
+  ros__parameters:
+    clicked_point_topic: "/clicked_point"       # Topic to listen for PointStamped messages (e.g., from RViz)
+    output_yaml_file: "/home/brendoncintas/radmon_ws/src/ROS2_rad121/rad121_monitor/params/predefined_zones.yaml" # IMPORTANT: Set the FULL path where the zone definitions will be saved
+    default_zone_radius: 1.5                    # Default radius in meters for newly defined zones
+    map_frame: "map"                            # The TF frame in which zone coordinates will be stored (should match RViz fixed frame)
+    zone_label_prefix: ""                  # Prefix for automatically generated zone labels (e.g., Area_A, Area_B)

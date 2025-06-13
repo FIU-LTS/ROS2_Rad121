@@ -8,12 +8,13 @@
 #include "tf2_ros/transform_listener.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "time.h"
 
 #include <vector>
 #include <mutex>
 #include <fstream>
 #include <opencv2/opencv.hpp>
-#include <filesystem> // Requires C++17
+#include <filesystem>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -21,26 +22,54 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <utility> // For std::pair
+#include <utility>
+
+#include "yaml-cpp/yaml.h"
 
 class RadiationHeatmapNode : public rclcpp::Node
 {
 private:
     struct RadiationSample
     {
-        double x, y, cpm;
+        double x, y, cpm, mrem_hr;
     };
 
-    // --- Member Variables ---
+    struct LoggedRadiationEntry
+    {
+        rclcpp::Time timestamp;
+        double raw_cpm = 0.0;
+        double raw_mrem_hr = 0.0;
+        double map_x = std::numeric_limits<double>::quiet_NaN();
+        double map_y = std::numeric_limits<double>::quiet_NaN();
+        std::string status = "Unprocessed";
+    };
+
+    struct ZoneOfInterest
+    {
+        std::string label;
+        double map_x, map_y;
+        double radius;
+        double average_cpm;
+        double average_mrem_hr;
+        int contributing_samples_count;
+        std::vector<RadiationSample> collected_samples_in_zone;
+    };
+
     std::string session_folder_;
     std::string sensor_frame_, map_frame_;
     std::string output_directory_;
     double min_valid_cpm_, min_sample_cpm_;
-    double gaussian_sigma_, distance_cutoff_, background_threshold_;
+    double gaussian_sigma_, distance_cutoff_, background_threshold_mrem_hr_;
     int gaussian_blur_size_;
-    double overall_max_cpm_;
+    double overall_max_mrem_hr_;
+    double tf_timeout_seconds_;
+
+    std::string predefined_zones_file_path_;
+    std::vector<ZoneOfInterest> zones_of_interest_;
 
     std::vector<RadiationSample> samples_;
+    std::vector<LoggedRadiationEntry> logged_rad_entries_;
+
     nav_msgs::msg::OccupancyGrid base_map_, rad_costmap_;
     cv::Mat rad_field_, latest_blended_image_;
     std::mutex map_mutex_;
@@ -53,17 +82,19 @@ private:
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
 
-    // --- Initialization ---
-    void declareAndGetParameters() {
+    void declareAndGetParameters()
+    {
         this->declare_parameter<std::string>("sensor_frame", "base_link");
         this->declare_parameter<std::string>("map_frame", "map");
-        this->declare_parameter<std::string>("output_directory", ""); // New parameter for output dir
+        this->declare_parameter<std::string>("output_directory", "");
         this->declare_parameter<double>("min_valid_cpm", 50.0);
         this->declare_parameter<double>("min_sample_cpm", 100.0);
         this->declare_parameter<double>("gaussian_sigma", 5.0);
         this->declare_parameter<int>("gaussian_blur_size", 15);
         this->declare_parameter<double>("distance_cutoff", 10.0);
-        this->declare_parameter<double>("background_threshold", 400.0);
+        this->declare_parameter<double>("background_threshold_mrem_hr", 0.1);
+        this->declare_parameter<std::string>("predefined_zones_file", "");
+        this->declare_parameter<double>("tf_timeout_seconds", 0.2);
 
         sensor_frame_ = this->get_parameter("sensor_frame").as_string();
         map_frame_ = this->get_parameter("map_frame").as_string();
@@ -73,14 +104,79 @@ private:
         gaussian_sigma_ = this->get_parameter("gaussian_sigma").as_double();
         gaussian_blur_size_ = this->get_parameter("gaussian_blur_size").as_int();
         distance_cutoff_ = this->get_parameter("distance_cutoff").as_double();
-        background_threshold_ = this->get_parameter("background_threshold").as_double();
+        background_threshold_mrem_hr_ = this->get_parameter("background_threshold_mrem_hr").as_double();
+        predefined_zones_file_path_ = this->get_parameter("predefined_zones_file").as_string();
+        tf_timeout_seconds_ = this->get_parameter("tf_timeout_seconds").as_double();
 
-        // Ensure blur size is odd and positive
-        if (gaussian_blur_size_ <= 0) gaussian_blur_size_ = 1;
-        else if (gaussian_blur_size_ % 2 == 0) gaussian_blur_size_++;
+        if (gaussian_blur_size_ <= 0)
+            gaussian_blur_size_ = 1;
+        else if (gaussian_blur_size_ % 2 == 0)
+            gaussian_blur_size_++;
+
+        RCLCPP_INFO(this->get_logger(), "Predefined zones file path: '%s'", predefined_zones_file_path_.c_str());
+        RCLCPP_INFO(this->get_logger(), "TF transform timeout: %.2f seconds", tf_timeout_seconds_);
     }
 
-    void setupCommunications() {
+    void loadPredefinedZones()
+    {
+        if (predefined_zones_file_path_.empty())
+        {
+            RCLCPP_INFO(this->get_logger(), "Parameter 'predefined_zones_file' is empty. No predefined zones will be loaded.");
+            return;
+        }
+        if (!std::filesystem::exists(predefined_zones_file_path_))
+        {
+            RCLCPP_ERROR(this->get_logger(), "Predefined zones file not found at: '%s'. No zones loaded.", predefined_zones_file_path_.c_str());
+            return;
+        }
+
+        try
+        {
+            YAML::Node config = YAML::LoadFile(predefined_zones_file_path_);
+            if (config["predefined_zones"])
+            {
+                for (const auto &zone_node : config["predefined_zones"])
+                {
+                    if (!zone_node["label"] || !zone_node["center_x"] || !zone_node["center_y"] || !zone_node["radius"])
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Skipping malformed zone entry in '%s'. Missing one or more required fields (label, center_x, center_y, radius).", predefined_zones_file_path_.c_str());
+                        continue;
+                    }
+                    ZoneOfInterest zoi;
+                    zoi.label = zone_node["label"].as<std::string>();
+                    zoi.map_x = zone_node["center_x"].as<double>();
+                    zoi.map_y = zone_node["center_y"].as<double>();
+                    zoi.radius = zone_node["radius"].as<double>();
+                    zoi.average_cpm = 0.0;
+                    zoi.average_mrem_hr = 0.0;
+                    zoi.contributing_samples_count = 0;
+                    zones_of_interest_.push_back(zoi);
+                    RCLCPP_INFO(this->get_logger(), "Loaded predefined zone: '%s' at (%.2f, %.2f), Radius: %.2fm",
+                                zoi.label.c_str(), zoi.map_x, zoi.map_y, zoi.radius);
+                }
+                if (zones_of_interest_.empty() && config["predefined_zones"].IsSequence() && config["predefined_zones"].size() > 0)
+                {
+                    RCLCPP_WARN(this->get_logger(), "'predefined_zones' key exists in '%s' but all entries might be malformed or no valid zones were parsed.", predefined_zones_file_path_.c_str());
+                }
+                else if (zones_of_interest_.empty())
+                {
+                    RCLCPP_INFO(this->get_logger(), "'predefined_zones' key in '%s' is empty or does not contain valid zone entries.", predefined_zones_file_path_.c_str());
+                }
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(), "Predefined zones file '%s' does not contain 'predefined_zones' key or is empty.", predefined_zones_file_path_.c_str());
+            }
+        }
+        catch (const YAML::Exception &e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to load or parse predefined zones file '%s': %s",
+                         predefined_zones_file_path_.c_str(), e.what());
+        }
+    }
+
+    void setupCommunications()
+    {
         map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
             "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
             std::bind(&RadiationHeatmapNode::mapCallback, this, std::placeholders::_1));
@@ -89,295 +185,407 @@ private:
         rad_costmap_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rad_heatmap", 10);
     }
 
-    void createSessionFolder() {
+    void createSessionFolder()
+    {
         std::stringstream ss;
         std::time_t now = std::time(nullptr);
         ss << "rad_" << std::put_time(std::localtime(&now), "%Y%m%d_%H%M%S");
         std::string session_name = ss.str();
-
         std::filesystem::path base_path;
-        if (output_directory_.empty()) {
+        if (output_directory_.empty())
+        {
             base_path = std::filesystem::current_path();
             RCLCPP_INFO(this->get_logger(), "Output directory parameter not set. Using current working directory: %s", base_path.c_str());
-        } else {
+        }
+        else
+        {
             base_path = output_directory_;
         }
-
         session_folder_ = (base_path / session_name).string();
-
-        try {
-            if (std::filesystem::create_directories(session_folder_)) {
-                RCLCPP_INFO(this->get_logger(), "Created session folder: %s", session_folder_.c_str());
-            } else {
-                RCLCPP_INFO(this->get_logger(), "Session folder already exists or using existing directory: %s", session_folder_.c_str());
+        try
+        {
+            if (!std::filesystem::exists(session_folder_))
+            {
+                if (!std::filesystem::create_directories(session_folder_))
+                {
+                    RCLCPP_ERROR(this->get_logger(), "Failed to create session folder (create_directories returned false): %s", session_folder_.c_str());
+                    session_folder_ = session_name;
+                    if (!std::filesystem::exists(session_folder_))
+                    {
+                        std::filesystem::create_directory(session_folder_);
+                        RCLCPP_WARN(this->get_logger(), "Falling back to relative session path: %s", session_folder_.c_str());
+                    }
+                    else
+                    {
+                        RCLCPP_INFO(this->get_logger(), "Using existing relative session path: %s", session_folder_.c_str());
+                    }
+                }
+                else
+                {
+                    RCLCPP_INFO(this->get_logger(), "Created session folder: %s", session_folder_.c_str());
+                }
             }
-        } catch (const std::filesystem::filesystem_error& e) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to create session folder '%s': %s", session_folder_.c_str(), e.what());
-            // Fallback to current directory without session subfolder? Or handle error appropriately.
-            // For now, we'll proceed assuming the path might become valid later, but saving might fail.
-            session_folder_ = session_name; // Use relative path if creation failed
-             RCLCPP_WARN(this->get_logger(), "Falling back to relative session path: %s", session_folder_.c_str());
+            else
+            {
+                RCLCPP_INFO(this->get_logger(), "Session folder already exists: %s", session_folder_.c_str());
+            }
+        }
+        catch (const std::filesystem::filesystem_error &e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Filesystem error creating session folder '%s': %s", session_folder_.c_str(), e.what());
+            session_folder_ = "rad_heatmap_default_session";
+            try
+            {
+                if (!std::filesystem::exists(session_folder_))
+                    std::filesystem::create_directory(session_folder_);
+                RCLCPP_FATAL(this->get_logger(), "Critically failed to create primary/fallback session folder. Using default: %s", session_folder_.c_str());
+            }
+            catch (const std::filesystem::filesystem_error &fe)
+            {
+                RCLCPP_FATAL(this->get_logger(), "ULTIMATE FALLBACK FAILED for session folder: %s. Data will not be saved.", fe.what());
+                session_folder_ = "";
+            }
         }
     }
 
-    // --- Visibility Check ---
-    bool isCellInBounds(int x, int y, int width, int height) const {
+    bool isCellInBounds(int x, int y, int width, int height) const
+    {
         return x >= 0 && x < width && y >= 0 && y < height;
     }
 
-    bool isMapOccupied(int x, int y, int width) {
+    bool isMapOccupied(int x, int y, int width)
+    {
         int idx = y * width + x;
-        if (static_cast<size_t>(idx) >= base_map_.data.size()) {
+        if (static_cast<size_t>(idx) >= base_map_.data.size())
+        {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "isVisible check: Index out of bounds.");
-            return true; // Treat out of bounds as occupied/unpassable
+            return true;
         }
-        return base_map_.data[idx] >= 50; // Occupied cell threshold
+        return base_map_.data[idx] >= 50;
     }
 
     bool isVisible(int x0, int y0, int x1, int y1)
     {
-        // Pre-check: If map isn't valid, assume not visible
-        if (base_map_.info.width == 0 || base_map_.info.height == 0) return false;
-
+        if (base_map_.info.width == 0 || base_map_.info.height == 0)
+            return false;
         int width = base_map_.info.width;
         int height = base_map_.info.height;
-
         int dx = std::abs(x1 - x0);
         int dy = -std::abs(y1 - y0);
         int sx = (x0 < x1) ? 1 : -1;
         int sy = (y0 < y1) ? 1 : -1;
         int err = dx + dy;
-
         while (true)
         {
-            if (!isCellInBounds(x0, y0, width, height)) return false; // Out of map bounds
-            if (isMapOccupied(x0, y0, width)) return false;         // Hit obstacle
-            if (x0 == x1 && y0 == y1) break;                       // Reached target
-
+            if (!isCellInBounds(x0, y0, width, height))
+                return false;
+            if (isMapOccupied(x0, y0, width))
+                return false;
+            if (x0 == x1 && y0 == y1)
+                break;
             int e2 = 2 * err;
-            // Bresenham line algorithm steps
-            if (e2 >= dy) { err += dy; x0 += sx; } // Step x
-            if (e2 <= dx) { err += dx; y0 += sy; } // Step y
+            if (e2 >= dy)
+            {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx)
+            {
+                err += dx;
+                y0 += sy;
+            }
         }
-        return true; // Reached target without hitting obstacle or going out of bounds
+        return true;
     }
 
-    // --- Callbacks ---
     void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-
-        if (msg->info.width == 0 || msg->info.height == 0) {
+        if (msg->info.width == 0 || msg->info.height == 0)
+        {
             RCLCPP_WARN(this->get_logger(), "Received map with zero dimensions. Ignoring.");
             return;
         }
-
         bool dimensions_changed = (rad_costmap_.info.width != msg->info.width ||
                                    rad_costmap_.info.height != msg->info.height);
         bool rad_field_needs_init = (rad_field_.empty() ||
-                                      static_cast<unsigned int>(rad_field_.rows) != msg->info.height ||
-                                      static_cast<unsigned int>(rad_field_.cols) != msg->info.width);
-
-        base_map_ = *msg; // Update base map
-
-        // Reinitialize structures if dimensions changed or rad_field is invalid
-        if (dimensions_changed || rad_field_needs_init) {
-             RCLCPP_INFO(this->get_logger(), "Map received/changed. Initializing/Resizing structures for size %u x %u", msg->info.width, msg->info.height);
-             rad_costmap_.header = msg->header;
-             rad_costmap_.info = msg->info;
-             rad_costmap_.data.assign(msg->info.width * msg->info.height, -1); // Use -1 for unknown
-             rad_field_ = cv::Mat::zeros(msg->info.height, msg->info.width, CV_32FC1);
+                                     static_cast<unsigned int>(rad_field_.rows) != msg->info.height ||
+                                     static_cast<unsigned int>(rad_field_.cols) != msg->info.width);
+        base_map_ = *msg;
+        if (dimensions_changed || rad_field_needs_init)
+        {
+            RCLCPP_INFO(this->get_logger(), "Map received/changed. Initializing/Resizing structures for size %u x %u", msg->info.width, msg->info.height);
+            rad_costmap_.header = msg->header;
+            rad_costmap_.info = msg->info;
+            rad_costmap_.data.assign(msg->info.width * msg->info.height, -1);
+            rad_field_ = cv::Mat::zeros(msg->info.height, msg->info.width, CV_32FC1);
+            updateRadiationField();
         }
-         // If only the map data updated but dimensions are the same, we don't need to reinitialize rad_field/rad_costmap
     }
 
     void radCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
     {
-        // Basic validation of incoming message
-        if (msg->data.empty() || msg->data[0] < min_valid_cpm_) {
-            // RCLCPP_DEBUG(this->get_logger(), "Ignoring low CPM sample: %.2f", msg->data.empty() ? 0.0 : msg->data[0]);
+        LoggedRadiationEntry current_log_entry;
+        current_log_entry.timestamp = this->now();
+
+        if (msg->data.empty())
+        {
+            current_log_entry.status = "EmptyDataPayload";
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "/rad message received with empty data payload.");
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            logged_rad_entries_.push_back(current_log_entry);
+            return;
+        }
+
+        current_log_entry.raw_cpm = msg->data[0];
+        current_log_entry.raw_mrem_hr = (msg->data.size() > 1) ? msg->data[1] : 0.0;
+        if (msg->data.size() <= 1)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Rad message data[1] (mrem/hr) not available. Defaulting to 0 for this sample.");
+        }
+
+        if (current_log_entry.raw_cpm < min_valid_cpm_)
+        {
+            current_log_entry.status = "BelowMinValidCPM";
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            logged_rad_entries_.push_back(current_log_entry);
             return;
         }
 
         geometry_msgs::msg::PoseStamped pose_in, pose_out;
         pose_in.header.frame_id = sensor_frame_;
-        pose_in.header.stamp = this->now(); // Use current time for transform lookup
+        pose_in.header.stamp = this->now();
+        bool tf_successful = false;
 
-        // Attempt to transform sensor pose to map frame
-        try {
-            pose_out = tf_buffer_.transform(pose_in, map_frame_, tf2::durationFromSec(0.1));
-        } catch (const tf2::TransformException &ex) {
-             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                  "TF Error transforming %s to %s: %s",
-                                  sensor_frame_.c_str(), map_frame_.c_str(), ex.what());
-            return;
+        try
+        {
+            pose_out = tf_buffer_.transform(pose_in, map_frame_, tf2::durationFromSec(tf_timeout_seconds_));
+            current_log_entry.map_x = pose_out.pose.position.x;
+            current_log_entry.map_y = pose_out.pose.position.y;
+            tf_successful = true;
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            current_log_entry.status = "TF_Failed";
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                 "TF Error transforming %s to %s: %s. Sample logged, not processed for heatmap.",
+                                 sensor_frame_.c_str(), map_frame_.c_str(), ex.what());
         }
 
-        double current_cpm = msg->data[0];
-
-        // Lock map data for processing
         std::lock_guard<std::mutex> lock(map_mutex_);
 
-        // Ensure map and internal structures are ready
-         if (base_map_.info.width == 0 || base_map_.info.height == 0 || rad_field_.empty()) {
-             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Map/RadField not initialized. Skipping radiation sample.");
-             return;
-         }
+        bool process_for_heatmap_and_zones = false;
 
-        // Update overall maximum CPM encountered
-        if (current_cpm > overall_max_cpm_) {
-            overall_max_cpm_ = current_cpm;
-            RCLCPP_INFO(this->get_logger(), "New overall max CPM: %.2f", overall_max_cpm_);
+        if (tf_successful)
+        {
+            if (current_log_entry.raw_cpm >= min_sample_cpm_)
+            {
+                current_log_entry.status = "ProcessedForHeatmap";
+                samples_.push_back({current_log_entry.map_x, current_log_entry.map_y, current_log_entry.raw_cpm, current_log_entry.raw_mrem_hr});
+                process_for_heatmap_and_zones = true;
+
+                if (current_log_entry.raw_mrem_hr > overall_max_mrem_hr_)
+                {
+                    overall_max_mrem_hr_ = current_log_entry.raw_mrem_hr;
+                    RCLCPP_DEBUG(this->get_logger(), "New overall max mrem/hr for heatmap scaling: %.4f", overall_max_mrem_hr_);
+                }
+
+                for (auto &zone : zones_of_interest_)
+                {
+                    double dx = current_log_entry.map_x - zone.map_x;
+                    double dy = current_log_entry.map_y - zone.map_y;
+                    double distance_sq = dx * dx + dy * dy;
+
+                    if (distance_sq <= (zone.radius * zone.radius))
+                    {
+                        zone.collected_samples_in_zone.push_back({current_log_entry.map_x, current_log_entry.map_y, current_log_entry.raw_cpm, current_log_entry.raw_mrem_hr});
+                        double sum_cpm = 0.0, sum_mrem_hr = 0.0;
+                        for (const auto &s : zone.collected_samples_in_zone)
+                        {
+                            sum_cpm += s.cpm;
+                            sum_mrem_hr += s.mrem_hr;
+                        }
+                        if (!zone.collected_samples_in_zone.empty())
+                        {
+                            zone.average_cpm = sum_cpm / zone.collected_samples_in_zone.size();
+                            zone.average_mrem_hr = sum_mrem_hr / zone.collected_samples_in_zone.size();
+                        }
+                        else
+                        {
+                            zone.average_cpm = 0.0;
+                            zone.average_mrem_hr = 0.0;
+                        }
+                        zone.contributing_samples_count = zone.collected_samples_in_zone.size();
+                        RCLCPP_DEBUG(this->get_logger(), "Robot in Zone '%s'. Avg mrem/hr: %.4f from %d samples.",
+                                     zone.label.c_str(), zone.average_mrem_hr, zone.contributing_samples_count);
+                    }
+                }
+            }
+            else
+            {
+                current_log_entry.status = "BelowMinSampleCPM_NotForHeatmap";
+            }
         }
 
-        // Add the new sample and trigger field update
-        samples_.push_back({pose_out.pose.position.x, pose_out.pose.position.y, current_cpm});
-        updateRadiationField();
+        logged_rad_entries_.push_back(current_log_entry);
+
+        if (process_for_heatmap_and_zones)
+        {
+            if (base_map_.info.width > 0 && base_map_.info.height > 0 && !rad_field_.empty())
+            {
+                updateRadiationField();
+            }
+            else
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Map/RadField not initialized. Skipping heatmap update for processed sample.");
+            }
+        }
     }
 
-    // --- Core Logic: Heatmap Update ---
-
-    // Helper to calculate contribution of samples to a single cell (reduces nesting)
-    std::pair<double, double> calculateCellContribution(int x, int y, double wx, double wy, double res,
-                                                       double origin_x, double origin_y, double inv_2sigma2,
-                                                       double distance_cutoff_sq, int grid_width, int grid_height)
+    std::pair<double, double> calculateCellContribution(int x_cell, int y_cell, double wx_cell_center, double wy_cell_center, double res,
+                                                        double origin_x, double origin_y, double inv_2sigma2,
+                                                        double distance_cutoff_sq, int grid_width, int grid_height)
     {
         double numerator = 0.0;
         double denominator = 0.0;
-
-        for (const auto &sample : samples_) // Loop level 1
+        for (const auto &sample : samples_)
         {
-            // Condition 1 (Level 2)
-            if (sample.cpm < min_sample_cpm_) continue;
-
-            int sx = static_cast<int>((sample.x - origin_x) / res);
-            int sy = static_cast<int>((sample.y - origin_y) / res);
-
-            // Condition 2 (Level 2) - Sample location valid?
-            if (!isCellInBounds(sx, sy, grid_width, grid_height)) continue;
-
-            // Condition 3 (Level 2) - Visible from sample?
-            if (!isVisible(sx, sy, x, y)) continue;
-
-            double dx = wx - sample.x;
-            double dy = wy - sample.y;
-            double dist_sq = dx * dx + dy * dy;
-
-            // Condition 4 (Level 2) - Within distance cutoff?
-            if (dist_sq > distance_cutoff_sq) continue;
-
-            // Passed all checks, calculate weight and add contribution
-            double weight = std::exp(-dist_sq * inv_2sigma2);
-            numerator += weight * sample.cpm;
+            int sx_sample_cell = static_cast<int>((sample.x - origin_x) / res);
+            int sy_sample_cell = static_cast<int>((sample.y - origin_y) / res);
+            if (!isCellInBounds(sx_sample_cell, sy_sample_cell, grid_width, grid_height))
+                continue;
+            if (!isVisible(sx_sample_cell, sy_sample_cell, x_cell, y_cell))
+                continue;
+            double dx_world = wx_cell_center - sample.x;
+            double dy_world = wy_cell_center - sample.y;
+            double dist_sq_world = dx_world * dx_world + dy_world * dy_world;
+            if (dist_sq_world > distance_cutoff_sq)
+                continue;
+            double weight = std::exp(-dist_sq_world * inv_2sigma2);
+            numerator += weight * sample.mrem_hr;
             denominator += weight;
         }
         return {numerator, denominator};
     }
 
-    // Calculates the raw radiation field based on samples
-    cv::Mat computeRawRadiationField() {
+    cv::Mat computeRawRadiationField()
+    {
         cv::Mat current_rad_field = cv::Mat::zeros(base_map_.info.height, base_map_.info.width, CV_32FC1);
         double res = base_map_.info.resolution;
         double origin_x = base_map_.info.origin.position.x;
         double origin_y = base_map_.info.origin.position.y;
         double inv_2sigma2 = 1.0 / (2.0 * gaussian_sigma_ * gaussian_sigma_);
         double distance_cutoff_sq = distance_cutoff_ * distance_cutoff_;
-
-        for (int y = 0; y < current_rad_field.rows; ++y) { // Loop level 1
-            for (int x = 0; x < current_rad_field.cols; ++x) { // Loop level 2
-                double wx = origin_x + x * res + res / 2.0;
-                double wy = origin_y + y * res + res / 2.0;
-
-                // Call helper function to get contributions (max nesting inside helper is level 2)
+        for (int y = 0; y < current_rad_field.rows; ++y)
+        {
+            for (int x = 0; x < current_rad_field.cols; ++x)
+            {
+                double wx_center = origin_x + (x + 0.5) * res;
+                double wy_center = origin_y + (y + 0.5) * res;
                 auto [numerator, denominator] = calculateCellContribution(
-                    x, y, wx, wy, res, origin_x, origin_y, inv_2sigma2, distance_cutoff_sq,
+                    x, y, wx_center, wy_center, res, origin_x, origin_y, inv_2sigma2, distance_cutoff_sq,
                     current_rad_field.cols, current_rad_field.rows);
-
-                // Assign value to cell (avoid division by zero)
                 current_rad_field.at<float>(y, x) = (denominator > 1e-9) ? static_cast<float>(numerator / denominator) : 0.0f;
             }
         }
         return current_rad_field;
     }
 
-    // Applies Gaussian blur to the field
-    void applyGaussianBlur(cv::Mat& field) {
-        if (gaussian_blur_size_ < 3 || gaussian_sigma_ <= 0) return; // No blur needed
+    void applyGaussianBlur(cv::Mat &field)
+    {
+        if (gaussian_blur_size_ < 3 || gaussian_sigma_ <= 0)
+            return;
         cv::GaussianBlur(field, field, cv::Size(gaussian_blur_size_, gaussian_blur_size_), gaussian_sigma_);
     }
 
-    // Applies background thresholding and finds true min/max CPM above threshold
-    std::pair<float, float> applyThresholdAndGetRange(cv::Mat& field) {
+    std::pair<float, float> applyThresholdAndGetRange(cv::Mat &field)
+    {
         float true_min = std::numeric_limits<float>::max();
         float true_max = std::numeric_limits<float>::lowest();
         bool found_value_above_threshold = false;
-
-        for (int y = 0; y < field.rows; ++y) { // Loop level 1
-            for (int x = 0; x < field.cols; ++x) { // Loop level 2
+        for (int y = 0; y < field.rows; ++y)
+        {
+            for (int x = 0; x < field.cols; ++x)
+            {
                 float &val = field.at<float>(y, x);
-                if (val < background_threshold_) { // Condition level 3
-                    val = 0.0f; // Set below threshold to 0
-                } else {
+                if (val < background_threshold_mrem_hr_)
+                {
+                    val = 0.0f;
+                }
+                else
+                {
                     true_min = std::min(true_min, val);
                     true_max = std::max(true_max, val);
                     found_value_above_threshold = true;
                 }
             }
         }
-
-        // Handle cases where no values are above threshold or range is zero
-        if (!found_value_above_threshold) {
-             if (!samples_.empty()) { // Only warn if we actually had samples
-                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-                                      "No radiation values above background threshold: %.2f", background_threshold_);
-             }
-             true_min = background_threshold_; // Default range if nothing found
-             true_max = background_threshold_ + 1.0f; // Avoid zero range
-        } else if (true_max <= true_min) {
-             true_max = true_min + 1.0f; // Ensure max > min
+        if (!found_value_above_threshold)
+        {
+            true_min = static_cast<float>(background_threshold_mrem_hr_);
+            true_max = static_cast<float>(background_threshold_mrem_hr_ + 0.01f);
+            if (!samples_.empty())
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                                     "No radiation values above background threshold: %.4f mrem/hr. Heatmap might appear blank.", background_threshold_mrem_hr_);
+            }
+        }
+        else if (true_max <= true_min)
+        {
+            true_max = true_min + 0.01f;
         }
         return {true_min, true_max};
     }
 
-    // Updates the costmap based on the processed radiation field
-    void updateCostmapData(const cv::Mat& field, float log_min, float log_range) {
-        if (log_range <= 1e-6) { // Check for invalid range before loop
-             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,"Log range too small. Check thresholds/scaling.");
-             log_range = 1.0f; // Prevent division by zero / large values
+    void updateCostmapData(const cv::Mat &field, float current_field_min_val, float current_field_max_val)
+    {
+        float log_min_val = std::log(std::max(current_field_min_val, 0.001f));
+        float log_max_val = std::log(std::max(current_field_max_val, current_field_min_val + 0.01f));
+        float log_range = log_max_val - log_min_val;
+
+        if (log_range <= 1e-6)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Logarithmic range for costmap is too small. Costmap might not be representative.");
+            log_range = 1.0f;
         }
 
-        for (int y = 0; y < field.rows; ++y) { // Loop level 1
-            for (int x = 0; x < field.cols; ++x) { // Loop level 2
+        for (int y = 0; y < field.rows; ++y)
+        {
+            for (int x = 0; x < field.cols; ++x)
+            {
                 int idx = y * field.cols + x;
-                if (idx < 0 || static_cast<size_t>(idx) >= rad_costmap_.data.size()) continue; // Bounds check
+                if (idx < 0 || static_cast<size_t>(idx) >= rad_costmap_.data.size())
+                    continue;
 
                 float val = field.at<float>(y, x);
-                if (val < background_threshold_) { // Condition level 3
-                    rad_costmap_.data[idx] = -1; // Use -1 for unknown/no significant radiation
-                } else {
-                    float log_val = std::log(std::max(val, 1.0f)); // Use log scale, ensure arg >= 1
-                    float scaled = 100.0f * (log_val - log_min) / log_range;
-                    // Clamp and bucket the value (optional, but can make costmap interpretation easier)
-                    // int8_t bucketed = static_cast<int8_t>(std::round(std::clamp(scaled, 0.0f, 100.0f) / 5.0f) * 5.0f);
-                    // rad_costmap_.data[idx] = std::max(static_cast<int8_t>(0), std::min(bucketed, static_cast<int8_t>(100)));
-                    rad_costmap_.data[idx] = static_cast<int8_t>(std::clamp(scaled, 0.0f, 100.0f)); // Direct scale 0-100
+                if (val < background_threshold_mrem_hr_)
+                {
+                    rad_costmap_.data[idx] = -1;
+                }
+                else
+                {
+                    float log_val = std::log(std::max(val, 0.001f));
+                    float scaled_cost = 100.0f * (log_val - log_min_val) / log_range;
+                    rad_costmap_.data[idx] = static_cast<int8_t>(std::clamp(scaled_cost, 0.0f, 100.0f));
                 }
             }
         }
     }
 
-    // Creates the base map image (grayscale)
-    cv::Mat createBaseMapImage() {
+    cv::Mat createBaseMapImage()
+    {
         cv::Mat base_gray(rad_field_.rows, rad_field_.cols, CV_8UC1);
-        for (int y = 0; y < rad_field_.rows; ++y) { // Loop level 1
-            for (int x = 0; x < rad_field_.cols; ++x) { // Loop level 2
+        for (int y = 0; y < rad_field_.rows; ++y)
+        {
+            for (int x = 0; x < rad_field_.cols; ++x)
+            {
                 int idx = y * rad_field_.cols + x;
-                uchar pixel_val = 127; // Default to gray for unknown/out-of-bounds
+                uchar pixel_val = 127;
                 if (isCellInBounds(x, y, base_map_.info.width, base_map_.info.height) &&
                     static_cast<size_t>(idx) < base_map_.data.size())
-                { // Condition level 3
+                {
                     int8_t occ = base_map_.data[idx];
-                    pixel_val = (occ == -1) ? 127 : (occ >= 50 ? 0 : 255); // Unknown=gray, Occupied=black, Free=white
+                    pixel_val = (occ == -1) ? 127 : (occ >= 50 ? 0 : 255);
                 }
                 base_gray.at<uchar>(y, x) = pixel_val;
             }
@@ -387,224 +595,378 @@ private:
         return base_bgr;
     }
 
-    // Creates the colored heatmap overlay image
-    cv::Mat createColorHeatmapImage(const cv::Mat& field, float log_min, float log_range) {
-         if (log_range <= 1e-6) log_range = 1.0f; // Prevent division issues
+    cv::Mat createColorHeatmapImage(const cv::Mat &field, float current_field_min_val, float current_field_max_val)
+    {
+        float log_min_val = std::log(std::max(current_field_min_val, 0.001f));
+        float log_max_val = std::log(std::max(current_field_max_val, current_field_min_val + 0.01f));
+        float log_range = log_max_val - log_min_val;
+        if (log_range <= 1e-6)
+            log_range = 1.0f;
 
-        cv::Mat scaled_field = cv::Mat::zeros(field.size(), CV_8UC1);
-        for (int y = 0; y < field.rows; ++y) { // Loop level 1
-            for (int x = 0; x < field.cols; ++x) { // Loop level 2
+        cv::Mat scaled_field_for_colormap = cv::Mat::zeros(field.size(), CV_8UC1);
+        for (int y = 0; y < field.rows; ++y)
+        {
+            for (int x = 0; x < field.cols; ++x)
+            {
                 float val = field.at<float>(y, x);
-                if (val >= background_threshold_) { // Condition level 3
-                    float log_val = std::log(std::max(val, 1.0f));
-                    float scaled = 255.0f * (log_val - log_min) / log_range;
-                    scaled_field.at<uchar>(y, x) = static_cast<uchar>(std::clamp(scaled, 0.0f, 255.0f));
+                if (val >= background_threshold_mrem_hr_)
+                {
+                    float log_val = std::log(std::max(val, 0.001f));
+                    float scaled_intensity = 255.0f * (log_val - log_min_val) / log_range;
+                    scaled_field_for_colormap.at<uchar>(y, x) = static_cast<uchar>(std::clamp(scaled_intensity, 0.0f, 255.0f));
                 }
             }
         }
-
         cv::Mat color_field;
-        cv::applyColorMap(scaled_field, color_field, cv::COLORMAP_JET);
-
-        // Mask out areas below threshold (make them transparent/black in the overlay)
-        cv::Mat mask;
-        cv::compare(field, background_threshold_, mask, cv::CMP_LT); // Find pixels < threshold
-        color_field.setTo(cv::Scalar(0, 0, 0), mask); // Set those pixels to black in the color map
-
+        cv::applyColorMap(scaled_field_for_colormap, color_field, cv::COLORMAP_JET);
+        cv::Mat mask_below_threshold;
+        cv::compare(field, background_threshold_mrem_hr_, mask_below_threshold, cv::CMP_LT);
+        color_field.setTo(cv::Scalar(0, 0, 0), mask_below_threshold);
         return color_field;
     }
 
-    // Adds a color legend to the blended image
-    void addLegendToImage(cv::Mat& blended_image, float current_min_cpm, float overall_max_cpm_used) {
-         if (blended_image.empty()) return;
-
-         int legend_width = 50;
-         int legend_height = blended_image.rows / 2; // Adjust size as needed
-         int legend_y = blended_image.rows / 4;      // Position
-         int border_width = legend_width + 70;       // Space for legend + text
-
-         // Add border to the right for the legend
-         cv::copyMakeBorder(blended_image, blended_image, 0, 0, 0, border_width, cv::BORDER_CONSTANT, cv::Scalar(255, 255, 255));
-         int legend_x = blended_image.cols - border_width + 10; // X position within the new border
-
-         // Create the legend strip
-         cv::Mat legend(legend_height, legend_width, CV_8UC3);
-         for (int i = 0; i < legend_height; ++i) { // Loop level 1
-             // Map legend strip value (0-255) to colormap
-             uchar val_map = 255 - static_cast<uchar>((static_cast<float>(i) / legend_height) * 255.0f);
-             cv::Mat color_val(1, 1, CV_8UC1, cv::Scalar(val_map));
-             cv::Mat mapped_color;
-             cv::applyColorMap(color_val, mapped_color, cv::COLORMAP_JET);
-             if (!mapped_color.empty()) { // Condition level 2
-                 legend.row(i) = mapped_color.at<cv::Vec3b>(0, 0);
-             }
-         }
-
-         // Copy legend onto the bordered image if ROI is valid
-         if (legend_x >= 0 && legend_y >= 0 && legend_x + legend_width <= blended_image.cols && legend_y + legend_height <= blended_image.rows) { // Condition level 1
-              legend.copyTo(blended_image(cv::Rect(legend_x, legend_y, legend_width, legend_height)));
-         } else {
-              RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Legend ROI calculation is outside bordered image bounds.");
-              return; // Don't draw text if legend failed
-         }
-
-
-         // Add text labels next to the legend
-         int text_x = legend_x + legend_width + 5;
-         if (text_x < blended_image.cols) { // Condition level 1
-             cv::putText(blended_image, cv::format("%.1f", overall_max_cpm_used), cv::Point(text_x, legend_y + 15),
-                         cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-             cv::putText(blended_image, cv::format("%.1f", current_min_cpm), cv::Point(text_x, legend_y + legend_height - 5),
-                         cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-             cv::putText(blended_image, "CPM", cv::Point(text_x, legend_y + legend_height / 2),
-                         cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-         }
-    }
-
-    // Publishes the final costmap and image
-    void publishResults(const cv::Mat& blended_image) {
-        // Publish Costmap
-        rad_costmap_.header.stamp = this->now();
-        rad_costmap_.header.frame_id = map_frame_; // Ensure frame_id is set
-        rad_costmap_pub_->publish(rad_costmap_);
-
-        // Publish Image
-        if (!blended_image.empty() && rad_image_pub_.getNumSubscribers() > 0) { // Condition level 1
-             std_msgs::msg::Header header;
-             header.stamp = this->now();
-             header.frame_id = map_frame_; // Use map frame for the image too
-             try { // Try block level 2
-                 sensor_msgs::msg::Image::SharedPtr img_msg =
-                     cv_bridge::CvImage(header, "bgr8", blended_image).toImageMsg();
-                 rad_image_pub_.publish(*img_msg);
-             } catch (const cv_bridge::Exception& e) { // Catch block level 2
-                  RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "cv_bridge exception: %s", e.what());
-             } catch (const cv::Exception& e) { // Catch block level 2
-                  RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "OpenCV exception during image publishing: %s", e.what());
-             }
-        } else if (blended_image.empty()){
-             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Blended image is empty, cannot publish.");
+    void addLegendToImage(cv::Mat &blended_image, float display_min_val, float display_max_val)
+    {
+        if (blended_image.empty())
+            return;
+        int legend_width = 50;
+        int legend_height = blended_image.rows / 2;
+        int legend_y_offset = blended_image.rows / 4;
+        int border_padding = 80;
+        int total_legend_area_width = legend_width + border_padding;
+        cv::copyMakeBorder(blended_image, blended_image, 0, 0, 0, total_legend_area_width, cv::BORDER_CONSTANT, cv::Scalar(255, 255, 255));
+        int legend_origin_x = blended_image.cols - total_legend_area_width + 5;
+        int legend_origin_y = legend_y_offset;
+        cv::Mat legend_bar(legend_height, legend_width, CV_8UC3);
+        for (int i = 0; i < legend_height; ++i)
+        {
+            uchar val_for_map = 255 - static_cast<uchar>((static_cast<float>(i) / legend_height) * 255.0f);
+            cv::Mat single_color_value(1, 1, CV_8UC1, cv::Scalar(val_for_map));
+            cv::Mat mapped_color_strip;
+            cv::applyColorMap(single_color_value, mapped_color_strip, cv::COLORMAP_JET);
+            if (!mapped_color_strip.empty())
+            {
+                legend_bar.row(i) = mapped_color_strip.at<cv::Vec3b>(0, 0);
+            }
+        }
+        if (legend_origin_x >= 0 && legend_origin_y >= 0 &&
+            legend_origin_x + legend_width <= blended_image.cols &&
+            legend_origin_y + legend_height <= blended_image.rows)
+        {
+            legend_bar.copyTo(blended_image(cv::Rect(legend_origin_x, legend_origin_y, legend_width, legend_height)));
+        }
+        else
+        {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Legend ROI calculation is outside bordered image bounds.");
+            return;
+        }
+        int text_start_x = legend_origin_x + legend_width + 5;
+        if (text_start_x < blended_image.cols)
+        {
+            cv::putText(blended_image, cv::format("%.2f", display_max_val), cv::Point(text_start_x, legend_origin_y + 15),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+            cv::putText(blended_image, cv::format("%.2f", display_min_val), cv::Point(text_start_x, legend_origin_y + legend_height - 5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+            cv::putText(blended_image, "mrem/hr", cv::Point(text_start_x, legend_origin_y + legend_height / 2),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
         }
     }
 
+    void drawZoneMarkers(cv::Mat &image_to_draw_on)
+    {
+        if (base_map_.info.width == 0 || base_map_.info.height == 0 || image_to_draw_on.empty())
+        {
+            return;
+        }
+        double res = base_map_.info.resolution;
+        double origin_x = base_map_.info.origin.position.x;
+        double origin_y = base_map_.info.origin.position.y;
+
+        for (const auto &zone : zones_of_interest_)
+        {
+            int pixel_x = static_cast<int>((zone.map_x - origin_x) / res);
+            int pixel_y = static_cast<int>((zone.map_y - origin_y) / res);
+            int pixel_radius = static_cast<int>(zone.radius / res);
+
+            if (pixel_x >= 0 && pixel_x < image_to_draw_on.cols && pixel_y >= 0 && pixel_y < image_to_draw_on.rows)
+            {
+                cv::Point center(pixel_x, pixel_y);
+
+                cv::circle(image_to_draw_on, center, pixel_radius, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                cv::circle(image_to_draw_on, center, 5, cv::Scalar(255, 255, 255), -1);
+                cv::circle(image_to_draw_on, center, 5, cv::Scalar(0, 0, 0), 1);
+
+                cv::Point text_org(pixel_x + 8, pixel_y - 8);
+                if (text_org.x < 0)
+                    text_org.x = 5;
+                if (text_org.y < 15)
+                    text_org.y = 15;
+                if (text_org.x > image_to_draw_on.cols - 50)
+                    text_org.x = image_to_draw_on.cols - 50;
+                if (text_org.y > image_to_draw_on.rows - 5)
+                    text_org.y = image_to_draw_on.rows - 5;
+
+                cv::putText(image_to_draw_on, zone.label, text_org,
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
+                cv::putText(image_to_draw_on, zone.label, text_org,
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+            }
+        }
+    }
+
+    void publishResults(const cv::Mat &blended_image_to_publish)
+    {
+        rad_costmap_.header.stamp = this->now();
+        rad_costmap_.header.frame_id = map_frame_;
+        rad_costmap_pub_->publish(rad_costmap_);
+
+        if (!blended_image_to_publish.empty() && rad_image_pub_.getNumSubscribers() > 0)
+        {
+            std_msgs::msg::Header header;
+            header.stamp = this->now();
+            header.frame_id = map_frame_;
+            try
+            {
+                sensor_msgs::msg::Image::SharedPtr img_msg =
+                    cv_bridge::CvImage(header, "bgr8", blended_image_to_publish).toImageMsg();
+                rad_image_pub_.publish(*img_msg);
+            }
+            catch (const cv_bridge::Exception &e)
+            {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "cv_bridge exception: %s", e.what());
+            }
+            catch (const cv::Exception &e)
+            {
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "OpenCV exception during image publishing: %s", e.what());
+            }
+        }
+        else if (blended_image_to_publish.empty())
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Blended image is empty, cannot publish heatmap image.");
+        }
+    }
 
     void updateRadiationField()
     {
-        // Pre-condition check
-        if (base_map_.info.width == 0 || base_map_.info.height == 0 || rad_field_.empty()) {
-            RCLCPP_WARN_ONCE(this->get_logger(), "updateRadiationField called before map/rad_field initialized.");
+        if (base_map_.info.width == 0 || base_map_.info.height == 0 || rad_field_.empty())
+        {
+            RCLCPP_WARN_ONCE(this->get_logger(), "updateRadiationField called before map/rad_field fully initialized. Skipping update.");
             return;
         }
-
-        // 1. Compute raw field from samples
         rad_field_ = computeRawRadiationField();
-
-        // 2. Apply Gaussian Blur
         applyGaussianBlur(rad_field_);
+        auto [current_min_val_on_field, current_max_val_on_field] = applyThresholdAndGetRange(rad_field_);
+        float display_scaling_max_val = std::max(current_max_val_on_field, static_cast<float>(overall_max_mrem_hr_));
+        float display_scaling_min_val = current_min_val_on_field;
+        updateCostmapData(rad_field_, display_scaling_min_val, display_scaling_max_val);
 
-        // 3. Apply background threshold and get min/max range above threshold
-        auto [true_min_cpm, true_max_cpm] = applyThresholdAndGetRange(rad_field_);
-
-        // 4. Calculate log scale range for coloring/costmap
-        //    Use overall_max_cpm_ for the upper bound of the scale if it's higher
-        //    Use true_min_cpm (post-thresholding) for the lower bound
-        float scale_max_cpm = std::max(true_max_cpm, static_cast<float>(overall_max_cpm_));
-        float log_min = std::log(std::max(true_min_cpm, 1.0f));
-        float log_max = std::log(std::max(scale_max_cpm, true_min_cpm + 1.0f)); // Ensure max > min
-        float log_range = log_max - log_min;
-
-        // 5. Update the OccupancyGrid (Costmap) data
-        updateCostmapData(rad_field_, log_min, log_range);
-
-        // 6. Create visualization image: Base map + Heatmap overlay + Legend
         cv::Mat base_bgr = createBaseMapImage();
-        cv::Mat color_field = createColorHeatmapImage(rad_field_, log_min, log_range);
-
-        // Blend base map and heatmap
-        cv::Mat blended_image;
-        if (base_bgr.size() == color_field.size() && !base_bgr.empty()) {
-             cv::addWeighted(base_bgr, 0.5, color_field, 0.5, 0.0, blended_image);
-        } else {
-             RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Size mismatch or empty image before blending.");
-             return; // Cannot proceed if blending failed
+        cv::Mat color_heatmap_overlay = createColorHeatmapImage(rad_field_, display_scaling_min_val, display_scaling_max_val);
+        cv::Mat blended_image_output;
+        if (base_bgr.size() == color_heatmap_overlay.size() && !base_bgr.empty())
+        {
+            cv::addWeighted(base_bgr, 0.5, color_heatmap_overlay, 0.5, 0.0, blended_image_output);
         }
-
-
-        // 7. Add legend
-        addLegendToImage(blended_image, true_min_cpm, scale_max_cpm); // Use the actual range used for scaling
-
-        // Store the latest image for saving on shutdown
-        latest_blended_image_ = blended_image.clone();
-
-        // 8. Publish costmap and image
-        publishResults(blended_image);
-
+        else
+        {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Size mismatch or empty image before blending. Cannot update heatmap image.");
+            if (!latest_blended_image_.empty())
+            {
+                publishResults(latest_blended_image_);
+            }
+            return;
+        }
+        addLegendToImage(blended_image_output, display_scaling_min_val, display_scaling_max_val);
+        if (!zones_of_interest_.empty())
+        {
+            drawZoneMarkers(blended_image_output);
+        }
+        latest_blended_image_ = blended_image_output.clone();
+        publishResults(blended_image_output);
     }
 
-    // --- Shutdown ---
     void saveMap()
     {
-        std::lock_guard<std::mutex> lock(map_mutex_); // Ensure thread safety if called concurrently
-
-        // Check if a valid image was generated and session folder is set
-        if (latest_blended_image_.empty()) {
-             RCLCPP_WARN(this->get_logger(), "No valid heatmap image was generated to save.");
-             return;
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (latest_blended_image_.empty())
+        {
+            RCLCPP_WARN(this->get_logger(), "No valid heatmap image to save.");
+            return;
         }
-         if (session_folder_.empty()) {
-             RCLCPP_ERROR(this->get_logger(), "Session folder path is not set. Cannot save map.");
-             return;
-         }
-
+        if (session_folder_.empty())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Session folder path is not set or invalid. Cannot save map image.");
+            return;
+        }
         std::string output_path = session_folder_ + "/map_with_heatmap.png";
-
-        try {
-            // Ensure the directory exists one last time
+        try
+        {
             std::filesystem::path dir_path = std::filesystem::path(session_folder_);
-            if (!std::filesystem::exists(dir_path)) {
+            if (!std::filesystem::exists(dir_path))
+            {
                 RCLCPP_WARN(this->get_logger(), "Session directory '%s' doesn't exist. Attempting to create.", session_folder_.c_str());
-                std::filesystem::create_directories(dir_path); // Try creating again
+                if (!std::filesystem::create_directories(dir_path))
+                {
+                    RCLCPP_ERROR(this->get_logger(), "Failed to create session directory '%s' for saving.", session_folder_.c_str());
+                    return;
+                }
             }
-
-            bool success = cv::imwrite(output_path, latest_blended_image_);
-            if (!success) {
-                 RCLCPP_ERROR(this->get_logger(), "Failed to save heatmap image to: %s", output_path.c_str());
-            } else {
-                 RCLCPP_INFO(this->get_logger(), "Saved final heatmap image to: %s", output_path.c_str());
+            if (!cv::imwrite(output_path, latest_blended_image_))
+            {
+                RCLCPP_ERROR(this->get_logger(), "Failed to save heatmap image to: %s", output_path.c_str());
             }
-        } catch (const std::filesystem::filesystem_error& e) {
-             RCLCPP_ERROR(this->get_logger(), "Filesystem error during saveMap for path '%s': %s", output_path.c_str(), e.what());
-        } catch (const cv::Exception& e) {
-             RCLCPP_ERROR(this->get_logger(), "OpenCV Exception during saveMap: %s", e.what());
+            else
+            {
+                RCLCPP_INFO(this->get_logger(), "Saved final heatmap image to: %s", output_path.c_str());
+            }
+        }
+        catch (const std::filesystem::filesystem_error &e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Filesystem error during saveMap for path '%s': %s", output_path.c_str(), e.what());
+        }
+        catch (const cv::Exception &e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "OpenCV Exception during saveMap: %s", e.what());
         }
     }
 
+    void saveRadiationData()
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (logged_rad_entries_.empty())
+        {
+            RCLCPP_INFO(this->get_logger(), "No radiation data entries logged to save.");
+            return;
+        }
+        if (session_folder_.empty())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Session folder path is not set or invalid. Cannot save radiation data CSV.");
+            return;
+        }
+        std::string output_path = session_folder_ + "/radiation_data.csv";
+        std::ofstream data_file(output_path);
+        if (!data_file.is_open())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open radiation_data.csv for writing: %s", output_path.c_str());
+            return;
+        }
+        data_file << "Timestamp_sec,Timestamp_nanosec,RawCPM,RawMRHR,MapX,MapY,Status\n";
+        for (const auto &entry : logged_rad_entries_)
+        {
+            uint64_t total_nanoseconds = entry.timestamp.nanoseconds();
+            uint32_t seconds = static_cast<uint32_t>(total_nanoseconds / 1000000000ULL);
+            uint32_t nanoseconds_part = static_cast<uint32_t>(total_nanoseconds % 1000000000ULL);
+
+            data_file << seconds << ","
+                      << nanoseconds_part << ","
+                      << entry.raw_cpm << ","
+                      << entry.raw_mrem_hr << ",";
+            if (std::isnan(entry.map_x))
+                data_file << ",";
+            else
+                data_file << entry.map_x << ",";
+            if (std::isnan(entry.map_y))
+                data_file << ",";
+            else
+                data_file << entry.map_y << ",";
+            data_file << "\"" << entry.status << "\"\n";
+        }
+        data_file.close();
+        if (data_file.good())
+        {
+            RCLCPP_INFO(this->get_logger(), "Saved all %zu radiation log entries to: %s", logged_rad_entries_.size(), output_path.c_str());
+        }
+        else
+        {
+            RCLCPP_ERROR(this->get_logger(), "Error occurred while writing or closing radiation_data.csv: %s", output_path.c_str());
+        }
+    }
+
+    void saveZoneSummaryData()
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (zones_of_interest_.empty())
+        {
+            RCLCPP_INFO(this->get_logger(), "No Zones of Interest defined/loaded to save summary.");
+            return;
+        }
+        if (session_folder_.empty())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Session folder path is not set or invalid. Cannot save zone_summary.csv.");
+            return;
+        }
+        std::string output_path = session_folder_ + "/zone_summary.csv";
+        std::ofstream data_file(output_path);
+        if (!data_file.is_open())
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open zone_summary.csv for writing: %s", output_path.c_str());
+            return;
+        }
+        data_file << "ZoneLabel,MapX,MapY,Radius,AverageCPM,AverageMRHR,ContributingSamples\n";
+        for (const auto &zone : zones_of_interest_)
+        {
+            data_file << "\"" << zone.label << "\","
+                      << zone.map_x << "," << zone.map_y << "," << zone.radius << ","
+                      << zone.average_cpm << "," << zone.average_mrem_hr << ","
+                      << zone.contributing_samples_count << "\n";
+        }
+        data_file.close();
+        if (data_file.good())
+        {
+            RCLCPP_INFO(this->get_logger(), "Saved Zone of Interest summary data to: %s", output_path.c_str());
+        }
+        else
+        {
+            RCLCPP_ERROR(this->get_logger(), "Error occurred while writing or closing zone_summary.csv: %s", output_path.c_str());
+        }
+    }
 
 public:
     RadiationHeatmapNode()
         : Node("radiation_heatmap_node"),
           tf_buffer_(this->get_clock()),
           tf_listener_(tf_buffer_),
-          overall_max_cpm_(0.0) // Initialize overall max CPM
+          overall_max_mrem_hr_(0.0)
     {
         declareAndGetParameters();
-        overall_max_cpm_ = background_threshold_; // Initialize overall max to background threshold initially
+        overall_max_mrem_hr_ = background_threshold_mrem_hr_;
         createSessionFolder();
+        loadPredefinedZones();
         setupCommunications();
 
         RCLCPP_INFO(this->get_logger(), "Radiation Heatmap Node Initialized.");
-        RCLCPP_INFO(this->get_logger(), "Outputting artifacts to: %s", session_folder_.c_str());
-        RCLCPP_INFO(this->get_logger(), "Waiting for map on topic /map...");
+        if (!session_folder_.empty())
+        {
+            RCLCPP_INFO(this->get_logger(), "Outputting artifacts to: %s", session_folder_.c_str());
+        }
+        else
+        {
+            RCLCPP_WARN(this->get_logger(), "Session folder could not be established. Data saving will be disabled.");
+        }
+        RCLCPP_INFO(this->get_logger(), "Listening for map on /map and radiation on /rad.");
 
-        // Register shutdown hook
-        rclcpp::on_shutdown([this]() {
-            RCLCPP_INFO(this->get_logger(), "Shutdown requested. Saving final map...");
+        if (!predefined_zones_file_path_.empty() && zones_of_interest_.empty())
+        {
+            RCLCPP_WARN(this->get_logger(), "Predefined zones file was specified ('%s') but no zones were loaded. Check file content, path, and permissions.", predefined_zones_file_path_.c_str());
+        }
+        else if (!zones_of_interest_.empty())
+        {
+            RCLCPP_INFO(this->get_logger(), "%zu predefined zones loaded. Monitoring active.", zones_of_interest_.size());
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(), "No predefined zones specified or loaded. Heatmap will be generated without zone-specific averaging.");
+        }
+
+        rclcpp::on_shutdown([this]()
+                            {
+            RCLCPP_INFO(this->get_logger(), "Shutdown requested. Saving final map, radiation data, and ZOI summary...");
             saveMap();
-            RCLCPP_INFO(this->get_logger(), "Radiation Heatmap Node shutting down.");
-        });
+            saveRadiationData();
+            saveZoneSummaryData();
+            RCLCPP_INFO(this->get_logger(), "Radiation Heatmap Node shutting down gracefully."); });
     }
 
-    // Needs to be called after construction because it uses shared_from_this()
     void init_image_transport()
     {
         image_transport::ImageTransport it(shared_from_this());
@@ -616,7 +978,7 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<RadiationHeatmapNode>();
-    node->init_image_transport(); // Initialize image transport separately
+    node->init_image_transport();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
