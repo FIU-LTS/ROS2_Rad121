@@ -42,6 +42,8 @@ private:
         double map_x = std::numeric_limits<double>::quiet_NaN();
         double map_y = std::numeric_limits<double>::quiet_NaN();
         std::string status = "Unprocessed";
+        std::string containing_zone_label = "N/A";
+        std::string closest_zone_label = "N/A";
     };
 
     struct ZoneOfInterest
@@ -49,10 +51,6 @@ private:
         std::string label;
         double map_x, map_y;
         double radius;
-        double average_cpm;
-        double average_mrem_hr;
-        int contributing_samples_count;
-        std::vector<RadiationSample> collected_samples_in_zone;
     };
 
     std::string session_folder_;
@@ -115,6 +113,7 @@ private:
 
         RCLCPP_INFO(this->get_logger(), "Predefined zones file path: '%s'", predefined_zones_file_path_.c_str());
         RCLCPP_INFO(this->get_logger(), "TF transform timeout: %.2f seconds", tf_timeout_seconds_);
+        RCLCPP_INFO(this->get_logger(), "Background threshold (mrem/hr): %.4f", background_threshold_mrem_hr_);
     }
 
     void loadPredefinedZones()
@@ -147,9 +146,7 @@ private:
                     zoi.map_x = zone_node["center_x"].as<double>();
                     zoi.map_y = zone_node["center_y"].as<double>();
                     zoi.radius = zone_node["radius"].as<double>();
-                    zoi.average_cpm = 0.0;
-                    zoi.average_mrem_hr = 0.0;
-                    zoi.contributing_samples_count = 0;
+
                     zones_of_interest_.push_back(zoi);
                     RCLCPP_INFO(this->get_logger(), "Loaded predefined zone: '%s' at (%.2f, %.2f), Radius: %.2fm",
                                 zoi.label.c_str(), zoi.map_x, zoi.map_y, zoi.radius);
@@ -177,11 +174,8 @@ private:
 
     void setupCommunications()
     {
-        map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-            "/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
-            std::bind(&RadiationHeatmapNode::mapCallback, this, std::placeholders::_1));
-        rad_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
-            "/rad", 10, std::bind(&RadiationHeatmapNode::radCallback, this, std::placeholders::_1));
+        map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>("/map", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(), std::bind(&RadiationHeatmapNode::mapCallback, this, std::placeholders::_1));
+        rad_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>("/rad", 10, std::bind(&RadiationHeatmapNode::radCallback, this, std::placeholders::_1));
         rad_costmap_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rad_heatmap", 10);
     }
 
@@ -195,7 +189,6 @@ private:
         if (output_directory_.empty())
         {
             base_path = std::filesystem::current_path();
-            RCLCPP_INFO(this->get_logger(), "Output directory parameter not set. Using current working directory: %s", base_path.c_str());
         }
         else
         {
@@ -208,82 +201,54 @@ private:
             {
                 if (!std::filesystem::create_directories(session_folder_))
                 {
-                    RCLCPP_ERROR(this->get_logger(), "Failed to create session folder (create_directories returned false): %s", session_folder_.c_str());
                     session_folder_ = session_name;
                     if (!std::filesystem::exists(session_folder_))
-                    {
                         std::filesystem::create_directory(session_folder_);
-                        RCLCPP_WARN(this->get_logger(), "Falling back to relative session path: %s", session_folder_.c_str());
-                    }
-                    else
-                    {
-                        RCLCPP_INFO(this->get_logger(), "Using existing relative session path: %s", session_folder_.c_str());
-                    }
                 }
-                else
-                {
-                    RCLCPP_INFO(this->get_logger(), "Created session folder: %s", session_folder_.c_str());
-                }
-            }
-            else
-            {
-                RCLCPP_INFO(this->get_logger(), "Session folder already exists: %s", session_folder_.c_str());
             }
         }
         catch (const std::filesystem::filesystem_error &e)
         {
-            RCLCPP_ERROR(this->get_logger(), "Filesystem error creating session folder '%s': %s", session_folder_.c_str(), e.what());
             session_folder_ = "rad_heatmap_default_session";
             try
             {
                 if (!std::filesystem::exists(session_folder_))
                     std::filesystem::create_directory(session_folder_);
-                RCLCPP_FATAL(this->get_logger(), "Critically failed to create primary/fallback session folder. Using default: %s", session_folder_.c_str());
             }
             catch (const std::filesystem::filesystem_error &fe)
             {
-                RCLCPP_FATAL(this->get_logger(), "ULTIMATE FALLBACK FAILED for session folder: %s. Data will not be saved.", fe.what());
                 session_folder_ = "";
             }
         }
+        if (!session_folder_.empty())
+            RCLCPP_INFO(this->get_logger(), "Session folder: %s", session_folder_.c_str());
+        else
+            RCLCPP_ERROR(this->get_logger(), "Could not create session folder. Data saving disabled.");
     }
 
-    bool isCellInBounds(int x, int y, int width, int height) const
-    {
-        return x >= 0 && x < width && y >= 0 && y < height;
-    }
-
+    bool isCellInBounds(int x, int y, int width, int height) const { return x >= 0 && x < width && y >= 0 && y < height; }
     bool isMapOccupied(int x, int y, int width)
     {
         int idx = y * width + x;
         if (static_cast<size_t>(idx) >= base_map_.data.size())
-        {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "isVisible check: Index out of bounds.");
             return true;
-        }
         return base_map_.data[idx] >= 50;
     }
-
     bool isVisible(int x0, int y0, int x1, int y1)
     {
-        if (base_map_.info.width == 0 || base_map_.info.height == 0)
+        if (base_map_.info.width == 0)
             return false;
-        int width = base_map_.info.width;
-        int height = base_map_.info.height;
-        int dx = std::abs(x1 - x0);
-        int dy = -std::abs(y1 - y0);
-        int sx = (x0 < x1) ? 1 : -1;
-        int sy = (y0 < y1) ? 1 : -1;
-        int err = dx + dy;
+        int w = base_map_.info.width, h = base_map_.info.height;
+        int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+        int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy, e2;
         while (true)
         {
-            if (!isCellInBounds(x0, y0, width, height))
-                return false;
-            if (isMapOccupied(x0, y0, width))
+            if (!isCellInBounds(x0, y0, w, h) || isMapOccupied(x0, y0, w))
                 return false;
             if (x0 == x1 && y0 == y1)
                 break;
-            int e2 = 2 * err;
+            e2 = 2 * err;
             if (e2 >= dy)
             {
                 err += dy;
@@ -303,18 +268,13 @@ private:
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (msg->info.width == 0 || msg->info.height == 0)
         {
-            RCLCPP_WARN(this->get_logger(), "Received map with zero dimensions. Ignoring.");
             return;
         }
-        bool dimensions_changed = (rad_costmap_.info.width != msg->info.width ||
-                                   rad_costmap_.info.height != msg->info.height);
-        bool rad_field_needs_init = (rad_field_.empty() ||
-                                     static_cast<unsigned int>(rad_field_.rows) != msg->info.height ||
-                                     static_cast<unsigned int>(rad_field_.cols) != msg->info.width);
+        bool dim_changed = (rad_costmap_.info.width != msg->info.width || rad_costmap_.info.height != msg->info.height);
+        bool field_init = (rad_field_.empty() || (unsigned int)rad_field_.rows != msg->info.height || (unsigned int)rad_field_.cols != msg->info.width);
         base_map_ = *msg;
-        if (dimensions_changed || rad_field_needs_init)
+        if (dim_changed || field_init)
         {
-            RCLCPP_INFO(this->get_logger(), "Map received/changed. Initializing/Resizing structures for size %u x %u", msg->info.width, msg->info.height);
             rad_costmap_.header = msg->header;
             rad_costmap_.info = msg->info;
             rad_costmap_.data.assign(msg->info.width * msg->info.height, -1);
@@ -374,51 +334,47 @@ private:
 
         std::lock_guard<std::mutex> lock(map_mutex_);
 
-        bool process_for_heatmap_and_zones = false;
+        bool process_for_heatmap = false;
 
         if (tf_successful)
         {
+            if (!zones_of_interest_.empty())
+            {
+                double min_dist_sq = std::numeric_limits<double>::max();
+                for (const auto &zone : zones_of_interest_)
+                {
+                    double dx = current_log_entry.map_x - zone.map_x;
+                    double dy = current_log_entry.map_y - zone.map_y;
+                    double dist_sq = dx * dx + dy * dy;
+
+                    if (dist_sq < min_dist_sq)
+                    {
+                        min_dist_sq = dist_sq;
+                        current_log_entry.closest_zone_label = zone.label;
+                    }
+                    if (dist_sq <= (zone.radius * zone.radius))
+                    {
+                        if (current_log_entry.containing_zone_label == "N/A")
+                        {
+                            current_log_entry.containing_zone_label = zone.label;
+                        }
+                    }
+                }
+            }
+
             if (current_log_entry.raw_cpm >= min_sample_cpm_)
             {
                 current_log_entry.status = "ProcessedForHeatmap";
+                double value_for_heatmap = (msg->data.size() > 1) ? current_log_entry.raw_mrem_hr : current_log_entry.raw_cpm;
+                std::string unit_for_heatmap = (msg->data.size() > 1) ? "mrem/hr" : "CPM";
+
                 samples_.push_back({current_log_entry.map_x, current_log_entry.map_y, current_log_entry.raw_cpm, current_log_entry.raw_mrem_hr});
-                process_for_heatmap_and_zones = true;
+                process_for_heatmap = true;
 
                 if (current_log_entry.raw_mrem_hr > overall_max_mrem_hr_)
                 {
                     overall_max_mrem_hr_ = current_log_entry.raw_mrem_hr;
                     RCLCPP_DEBUG(this->get_logger(), "New overall max mrem/hr for heatmap scaling: %.4f", overall_max_mrem_hr_);
-                }
-
-                for (auto &zone : zones_of_interest_)
-                {
-                    double dx = current_log_entry.map_x - zone.map_x;
-                    double dy = current_log_entry.map_y - zone.map_y;
-                    double distance_sq = dx * dx + dy * dy;
-
-                    if (distance_sq <= (zone.radius * zone.radius))
-                    {
-                        zone.collected_samples_in_zone.push_back({current_log_entry.map_x, current_log_entry.map_y, current_log_entry.raw_cpm, current_log_entry.raw_mrem_hr});
-                        double sum_cpm = 0.0, sum_mrem_hr = 0.0;
-                        for (const auto &s : zone.collected_samples_in_zone)
-                        {
-                            sum_cpm += s.cpm;
-                            sum_mrem_hr += s.mrem_hr;
-                        }
-                        if (!zone.collected_samples_in_zone.empty())
-                        {
-                            zone.average_cpm = sum_cpm / zone.collected_samples_in_zone.size();
-                            zone.average_mrem_hr = sum_mrem_hr / zone.collected_samples_in_zone.size();
-                        }
-                        else
-                        {
-                            zone.average_cpm = 0.0;
-                            zone.average_mrem_hr = 0.0;
-                        }
-                        zone.contributing_samples_count = zone.collected_samples_in_zone.size();
-                        RCLCPP_DEBUG(this->get_logger(), "Robot in Zone '%s'. Avg mrem/hr: %.4f from %d samples.",
-                                     zone.label.c_str(), zone.average_mrem_hr, zone.contributing_samples_count);
-                    }
                 }
             }
             else
@@ -429,7 +385,7 @@ private:
 
         logged_rad_entries_.push_back(current_log_entry);
 
-        if (process_for_heatmap_and_zones)
+        if (process_for_heatmap)
         {
             if (base_map_.info.width > 0 && base_map_.info.height > 0 && !rad_field_.empty())
             {
@@ -527,7 +483,7 @@ private:
             if (!samples_.empty())
             {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-                                     "No radiation values above background threshold: %.4f mrem/hr. Heatmap might appear blank.", background_threshold_mrem_hr_);
+                                     "No radiation values (mrem/hr) above background threshold: %.4f. Heatmap might appear blank.", background_threshold_mrem_hr_);
             }
         }
         else if (true_max <= true_min)
@@ -545,7 +501,7 @@ private:
 
         if (log_range <= 1e-6)
         {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Logarithmic range for costmap is too small. Costmap might not be representative.");
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Logarithmic range for costmap (mrem/hr) is too small. Costmap might not be representative.");
             log_range = 1.0f;
         }
 
@@ -576,24 +532,22 @@ private:
     {
         cv::Mat base_gray(rad_field_.rows, rad_field_.cols, CV_8UC1);
         for (int y = 0; y < rad_field_.rows; ++y)
-        {
             for (int x = 0; x < rad_field_.cols; ++x)
             {
                 int idx = y * rad_field_.cols + x;
-                uchar pixel_val = 127;
-                if (isCellInBounds(x, y, base_map_.info.width, base_map_.info.height) &&
-                    static_cast<size_t>(idx) < base_map_.data.size())
+                uchar pv = 127; // Default to unknown
+                if (isCellInBounds(x, y, base_map_.info.width, base_map_.info.height) && static_cast<size_t>(idx) < base_map_.data.size())
                 {
-                    int8_t occ = base_map_.data[idx];
-                    pixel_val = (occ == -1) ? 127 : (occ >= 50 ? 0 : 255);
+                    int8_t o = base_map_.data[idx];
+                    pv = (o == -1) ? 127 : (o >= 50 ? 0 : 255); // unknown, occupied, free
                 }
-                base_gray.at<uchar>(y, x) = pixel_val;
+                base_gray.at<uchar>(y, x) = pv; // Corrected line
             }
-        }
-        cv::Mat base_bgr;
-        cv::cvtColor(base_gray, base_bgr, cv::COLOR_GRAY2BGR);
-        return base_bgr;
+        cv::Mat bgr;
+        cv::cvtColor(base_gray, bgr, cv::COLOR_GRAY2BGR); // Corrected line
+        return bgr;
     }
+
 
     cv::Mat createColorHeatmapImage(const cv::Mat &field, float current_field_min_val, float current_field_max_val)
     {
@@ -675,41 +629,32 @@ private:
     void drawZoneMarkers(cv::Mat &image_to_draw_on)
     {
         if (base_map_.info.width == 0 || base_map_.info.height == 0 || image_to_draw_on.empty())
-        {
             return;
-        }
         double res = base_map_.info.resolution;
-        double origin_x = base_map_.info.origin.position.x;
-        double origin_y = base_map_.info.origin.position.y;
-
+        double ox = base_map_.info.origin.position.x;
+        double oy = base_map_.info.origin.position.y;
         for (const auto &zone : zones_of_interest_)
         {
-            int pixel_x = static_cast<int>((zone.map_x - origin_x) / res);
-            int pixel_y = static_cast<int>((zone.map_y - origin_y) / res);
-            int pixel_radius = static_cast<int>(zone.radius / res);
-
-            if (pixel_x >= 0 && pixel_x < image_to_draw_on.cols && pixel_y >= 0 && pixel_y < image_to_draw_on.rows)
+            int px = static_cast<int>((zone.map_x - ox) / res);
+            int py = static_cast<int>((zone.map_y - oy) / res);
+            int pr = static_cast<int>(zone.radius / res);
+            if (px >= 0 && px < image_to_draw_on.cols && py >= 0 && py < image_to_draw_on.rows)
             {
-                cv::Point center(pixel_x, pixel_y);
-
-                cv::circle(image_to_draw_on, center, pixel_radius, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
-                cv::circle(image_to_draw_on, center, 5, cv::Scalar(255, 255, 255), -1);
-                cv::circle(image_to_draw_on, center, 5, cv::Scalar(0, 0, 0), 1);
-
-                cv::Point text_org(pixel_x + 8, pixel_y - 8);
-                if (text_org.x < 0)
-                    text_org.x = 5;
-                if (text_org.y < 15)
-                    text_org.y = 15;
-                if (text_org.x > image_to_draw_on.cols - 50)
-                    text_org.x = image_to_draw_on.cols - 50;
-                if (text_org.y > image_to_draw_on.rows - 5)
-                    text_org.y = image_to_draw_on.rows - 5;
-
-                cv::putText(image_to_draw_on, zone.label, text_org,
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
-                cv::putText(image_to_draw_on, zone.label, text_org,
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+                cv::Point c(px, py);
+                cv::circle(image_to_draw_on, c, pr, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                cv::circle(image_to_draw_on, c, 5, cv::Scalar(255, 255, 255), -1);
+                cv::circle(image_to_draw_on, c, 5, cv::Scalar(0, 0, 0), 1);
+                cv::Point to(px + 8, py - 8);
+                if (to.x < 0)
+                    to.x = 5;
+                if (to.y < 15)
+                    to.y = 15;
+                if (to.x > image_to_draw_on.cols - 50)
+                    to.x = image_to_draw_on.cols - 50;
+                if (to.y > image_to_draw_on.rows - 5)
+                    to.y = image_to_draw_on.rows - 5;
+                cv::putText(image_to_draw_on, zone.label, to, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
+                cv::putText(image_to_draw_on, zone.label, to, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
             }
         }
     }
@@ -719,30 +664,27 @@ private:
         rad_costmap_.header.stamp = this->now();
         rad_costmap_.header.frame_id = map_frame_;
         rad_costmap_pub_->publish(rad_costmap_);
-
         if (!blended_image_to_publish.empty() && rad_image_pub_.getNumSubscribers() > 0)
         {
-            std_msgs::msg::Header header;
-            header.stamp = this->now();
-            header.frame_id = map_frame_;
+            std_msgs::msg::Header h;
+            h.stamp = this->now();
+            h.frame_id = map_frame_;
             try
             {
-                sensor_msgs::msg::Image::SharedPtr img_msg =
-                    cv_bridge::CvImage(header, "bgr8", blended_image_to_publish).toImageMsg();
-                rad_image_pub_.publish(*img_msg);
+                rad_image_pub_.publish(*cv_bridge::CvImage(h, "bgr8", blended_image_to_publish).toImageMsg());
             }
             catch (const cv_bridge::Exception &e)
             {
-                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "cv_bridge exception: %s", e.what());
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "cv_bridge ex: %s", e.what());
             }
             catch (const cv::Exception &e)
             {
-                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "OpenCV exception during image publishing: %s", e.what());
+                RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "OpenCV ex: %s", e.what());
             }
         }
         else if (blended_image_to_publish.empty())
         {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Blended image is empty, cannot publish heatmap image.");
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Blended image empty.");
         }
     }
 
@@ -788,45 +730,24 @@ private:
     void saveMap()
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        if (latest_blended_image_.empty())
+        if (latest_blended_image_.empty() || session_folder_.empty())
         {
-            RCLCPP_WARN(this->get_logger(), "No valid heatmap image to save.");
+            RCLCPP_WARN(get_logger(), "No image/session folder to save map.");
             return;
         }
-        if (session_folder_.empty())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Session folder path is not set or invalid. Cannot save map image.");
-            return;
-        }
-        std::string output_path = session_folder_ + "/map_with_heatmap.png";
+        std::string p = session_folder_ + "/map_with_heatmap.png";
         try
         {
-            std::filesystem::path dir_path = std::filesystem::path(session_folder_);
-            if (!std::filesystem::exists(dir_path))
-            {
-                RCLCPP_WARN(this->get_logger(), "Session directory '%s' doesn't exist. Attempting to create.", session_folder_.c_str());
-                if (!std::filesystem::create_directories(dir_path))
-                {
-                    RCLCPP_ERROR(this->get_logger(), "Failed to create session directory '%s' for saving.", session_folder_.c_str());
-                    return;
-                }
-            }
-            if (!cv::imwrite(output_path, latest_blended_image_))
-            {
-                RCLCPP_ERROR(this->get_logger(), "Failed to save heatmap image to: %s", output_path.c_str());
-            }
+            if (!std::filesystem::exists(session_folder_))
+                std::filesystem::create_directories(session_folder_);
+            if (!cv::imwrite(p, latest_blended_image_))
+                RCLCPP_ERROR(get_logger(), "Failed to save %s", p.c_str());
             else
-            {
-                RCLCPP_INFO(this->get_logger(), "Saved final heatmap image to: %s", output_path.c_str());
-            }
+                RCLCPP_INFO(get_logger(), "Saved %s", p.c_str());
         }
-        catch (const std::filesystem::filesystem_error &e)
+        catch (const std::exception &e)
         {
-            RCLCPP_ERROR(this->get_logger(), "Filesystem error during saveMap for path '%s': %s", output_path.c_str(), e.what());
-        }
-        catch (const cv::Exception &e)
-        {
-            RCLCPP_ERROR(this->get_logger(), "OpenCV Exception during saveMap: %s", e.what());
+            RCLCPP_ERROR(get_logger(), "SaveMap ex: %s", e.what());
         }
     }
 
@@ -850,7 +771,7 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Failed to open radiation_data.csv for writing: %s", output_path.c_str());
             return;
         }
-        data_file << "Timestamp_sec,Timestamp_nanosec,RawCPM,RawMRHR,MapX,MapY,Status\n";
+        data_file << "Timestamp_sec,Timestamp_nanosec,RawCPM,RawMRHR,MapX,MapY,Status,ContainingZoneLabel,ClosestZoneLabel\n";
         for (const auto &entry : logged_rad_entries_)
         {
             uint64_t total_nanoseconds = entry.timestamp.nanoseconds();
@@ -869,7 +790,9 @@ private:
                 data_file << ",";
             else
                 data_file << entry.map_y << ",";
-            data_file << "\"" << entry.status << "\"\n";
+            data_file << "\"" << entry.status << "\",";
+            data_file << "\"" << entry.containing_zone_label << "\",";
+            data_file << "\"" << entry.closest_zone_label << "\"\n";
         }
         data_file.close();
         if (data_file.good())
@@ -879,45 +802,6 @@ private:
         else
         {
             RCLCPP_ERROR(this->get_logger(), "Error occurred while writing or closing radiation_data.csv: %s", output_path.c_str());
-        }
-    }
-
-    void saveZoneSummaryData()
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        if (zones_of_interest_.empty())
-        {
-            RCLCPP_INFO(this->get_logger(), "No Zones of Interest defined/loaded to save summary.");
-            return;
-        }
-        if (session_folder_.empty())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Session folder path is not set or invalid. Cannot save zone_summary.csv.");
-            return;
-        }
-        std::string output_path = session_folder_ + "/zone_summary.csv";
-        std::ofstream data_file(output_path);
-        if (!data_file.is_open())
-        {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open zone_summary.csv for writing: %s", output_path.c_str());
-            return;
-        }
-        data_file << "ZoneLabel,MapX,MapY,Radius,AverageCPM,AverageMRHR,ContributingSamples\n";
-        for (const auto &zone : zones_of_interest_)
-        {
-            data_file << "\"" << zone.label << "\","
-                      << zone.map_x << "," << zone.map_y << "," << zone.radius << ","
-                      << zone.average_cpm << "," << zone.average_mrem_hr << ","
-                      << zone.contributing_samples_count << "\n";
-        }
-        data_file.close();
-        if (data_file.good())
-        {
-            RCLCPP_INFO(this->get_logger(), "Saved Zone of Interest summary data to: %s", output_path.c_str());
-        }
-        else
-        {
-            RCLCPP_ERROR(this->get_logger(), "Error occurred while writing or closing zone_summary.csv: %s", output_path.c_str());
         }
     }
 
@@ -960,10 +844,9 @@ public:
 
         rclcpp::on_shutdown([this]()
                             {
-            RCLCPP_INFO(this->get_logger(), "Shutdown requested. Saving final map, radiation data, and ZOI summary...");
+            RCLCPP_INFO(this->get_logger(), "Shutdown requested. Saving final map and radiation data...");
             saveMap();
             saveRadiationData();
-            saveZoneSummaryData();
             RCLCPP_INFO(this->get_logger(), "Radiation Heatmap Node shutting down gracefully."); });
     }
 

@@ -1,0 +1,53 @@
+predefined_zones:
+  - label: A
+    center_x: -11.744407653808594
+    center_y: -8.5129451751708984
+    radius: 1.5
+  - label: B
+    center_x: -12.694093704223633
+    center_y: -9.8200740814208984
+    radius: 1.5
+  - label: C
+    center_x: -14.058126449584961
+    center_y: -11.625869750976562
+    radius: 1.5
+  - label: D
+    center_x: -12.557214736938477
+    center_y: -12.854181289672852
+    radius: 1.5
+  - label: E
+    center_x: -11.098667144775391
+    center_y: -15.586275100708008
+    radius: 1.5
+  - label: F
+    center_x: -8.0448637008666992
+    center_y: -16.593952178955078
+    radius: 1.5
+  - label: G
+    center_x: -4.9966049194335938
+    center_y: -15.983526229858398
+    radius: 1.5
+  - label: H
+    center_x: -4.6472320556640625
+    center_y: -12.665048599243164
+    radius: 1.5
+  - label: I
+    center_x: -6.4810676574707031
+    center_y: -9.8183078765869141
+    radius: 1.5
+  - label: J
+    center_x: -17.585330963134766
+    center_y: -9.1615371704101562
+    radius: 1.5
+  - label: K
+    center_x: -16.0650634765625
+    center_y: -9.5435714721679688
+    radius: 1.5
+  - label: L
+    center_x: -15.52900505065918
+    center_y: -7.5105600357055664
+    radius: 1.5
+  - label: M
+    center_x: -9.3379545211791992
+    center_y: -4.3918623924255371
+    radius: 1.5
